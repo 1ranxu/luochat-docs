@@ -1098,3 +1098,682 @@ server {
 ```
 
 证书放在指定位置
+
+
+
+
+
+# WebSocket模块
+
+不仅仅是IM通讯系统，在很多业务中都会有服务端需要主动推送web的场景。比如小红点提醒，新消息提醒，审批流提醒等。那么常见的推送方案有哪些？
+
+## 服务端推送web方案 
+
+### 短轮询 
+
+短轮询，就是web端不停地间隔一段时间向服务端发一个 HTTP 请求，如果有新消息，就会在某次请求返回。
+
+![image-20231231200014476](assets/image-20231231200014476.png)
+
+
+
+比如OA系统，用户需要收到小红点，审批流提醒等信息，为了方便，就直接采用每秒1次的请求，等待后端返回数据。
+
+**适用场景：**
+
+- 扫码登录：短时间内频繁查询二维码状态
+
+- 小OA系统：客户端使用量不大的情况下可以使用
+
+**缺点：**
+
+- 大量无效请求：大量的无效请求，浪费服务器资源
+
+- 服务端请求压力大：万人群聊频繁访问，上万并发服务扛不住。
+
+
+
+### 长轮询 
+
+长轮询和短轮询相比，一个最大的改进之处在于：
+
+- 短轮询模式下，服务端不管本轮有没有新消息产生，都会马上响应并返回。而长轮询模式当本次请求没有获取到新消息时，并不会马上结束返回，而是会在服务端“悬挂（hang）”，等待一段时间；
+
+- 如果在等待的这段时间内有新消息产生，就能马上响应返回。
+
+这也意味着web端的请求超时时长得设置长一些。
+
+![image-20231231200711505](assets/image-20231231200711505.png)
+
+
+
+**优点：相比短轮询模式**
+
+- 大幅降低短轮询模式中客户端高频无用的轮询导致的网络开销和功耗开销
+
+- 降低了服务端处理请求的 QPS
+
+**缺点：**
+
+- 无效请求：长轮询在超时时间内没有获取到消息时，会结束返回，因此仍然没有完全解决客户端“无效”请求的问题。
+
+- 服务端压力大：服务端悬挂（hang）住请求，只是降低了入口请求的 QPS，并没有减少对后端资源轮询的压力。假如有 1000 个请求在等待消息，可能意味着有 1000 个线程在不断轮询消息存储资源。（轮询转移到了后端）
+
+
+
+### Websocket长连接 
+
+长轮询和短轮询是通过服务端被动地接收客户端发起的询问请求，从而达到服务端向客户端推送的一种曲线救国的方式，那最好的方案就是服务端直接向客户端推送，因此诞生了websocket。
+
+实现原理：客户端和服务器之间维持一个 TCP/IP 长连接，全双工通道。
+
+![image-20231231201235249](assets/image-20231231201235249.png)
+
+基本弥补了上面的缺点，唯一的缺点就是实现起来可能会有些复杂，我们需要去管理链接。
+
+
+
+### websocket代码实现方案 
+
+支持websocket的容器很多，我们实现一般用两种常见方案。
+
+
+
+#### tomcat实现websocket 
+
+原理和使用细节可以查看https://blog.csdn.net/devcloud/article/details/124681914
+
+
+
+#### netty实现websocket 
+
+用netty实现websocket可以看项目代码，或者参考文章：https://blog.csdn.net/mahao25/article/details/127418543
+
+
+
+#### 为什么选netty不用tomcat？ 
+
+- netty是nio基于事件驱动的多路复用框架，使用单线程或少量线程处理大量的并发连接。相比之下，Tomcat 是基于多线程的架构，每个连接都会分配一个线程，适用于处理相对较少的并发连接。最近的 Tomcat 版本（如 Tomcat 8、9）引入了 NIO（New I/O）模型。所以这个点并不是重点。
+
+- Netty 提供了丰富的功能和组件，可以灵活地构建自定义的网络应用。它具有强大的编解码器和处理器，可以轻松处理复杂的协议和数据格式。Netty 的扩展性也非常好，可以根据需要添加自定义的组件。比如我们可以用netty的pipeline方便的进行前置后置的处理，可以用netty的心跳处理器来检查连接的状态。这些都是netty的优势。
+
+
+
+### websocket的连接过程 
+
+客户端依靠发起HTTP握手，告诉服务端进行WebSocket协议通讯，并告知WebSocket协议版本。服务端确认协议版本，升级为WebSocket协议。之后如果有数据需要推送，会主动推送给客户端。 
+
+![image-20231231202611491](assets/image-20231231202611491.png)
+
+
+
+连接开始时，客户端使用HTTP协议和服务端升级协议，升级完成后，后续数据交换遵循WebSocket协议。我们看看Request Headers
+
+![image-20231231202926986](assets/image-20231231202926986.png)
+
+
+
+其中关键的字段Upgrade,Connection就是告诉 Apache 、 Nginx 等服务器：注意啦，我要升级成Websocket协议，不再使用原先的HTTP。
+
+其中，Sec-WebSocket-Key当成是请求id就好了。
+
+
+
+![image-20231231203120912](assets/image-20231231203120912.png)
+
+Sec-WebSocket-Accept: 用来告知服务器愿意发起一个websocket连接， 值是根据客户端请求头的Sec-WebSocket-Key计算出来。
+
+## 项目搭建和多环境配置
+
+### 创建父模块
+
+![image-20231231204336100](assets/image-20231231204336100.png)
+
+### 创建子模块
+
+![image-20231231204818582](assets/image-20231231204818582.png)
+
+![image-20231231205043330](assets/image-20231231205043330.png)
+
+![image-20231231205306504](assets/image-20231231205306504.png)
+
+对子模块进行版本管理
+
+![image-20231231205956974](assets/image-20231231205956974.png)
+
+luochat-chat-server引入common包
+
+![image-20231231210049693](assets/image-20231231210049693.png)
+
+### 编写配置
+
+`luochat-backend的pom`
+
+```xml
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>2.6.7</version>
+    <relativePath/> <!-- lookup parent from repository -->
+</parent>
+<properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncodi
+    <java.version>1.8</java.version>
+    <skipTests>true</skipTests>
+    <docker.host>http://192.168.3.101:2375</docker.host>
+    <hutool.version>5.8.18</hutool.version>
+    <springfox-swagger.version>3.0.0</springfox-swagger.version>
+    <swagger-models.version>1.6.0</swagger-models.version>
+    <mybatis-plus-generator.version>3.4.1</mybatis-plus-generator.version>
+    <mybatis.version>3.5.10</mybatis.version>
+    <mysql-connector.version>8.0.29</mysql-connector.version>
+    <spring-data-commons.version>2.7.5</spring-data-commons.version>
+    <jjwt.version>0.9.1</jjwt.version>
+    <logstash-logback.version>7.2</logstash-logback.version>
+    <minio.version>8.4.5</minio.version>
+    <jaxb-api.version>2.3.1</jaxb-api.version>
+    <lombok.version>1.18.10</lombok.version>
+    <netty-all.version>4.1.76.Final</netty-all.version>
+    <weixin-java-mp.version>4.4.0</weixin-java-mp.version>
+    <mybatis-plus-boot-starter.version>3.4.0</mybatis-plus-boot-starter.ver
+    <jsoup.version>1.15.3</jsoup.version>
+    <okhttp.version>4.8.1</okhttp.version>
+    <redisson-spring-boot-starter.version>3.17.1</redisson-spring-boot-star
+</properties>
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>com.luoying</groupId>
+            <artifactId>luochat-common-starter</artifactId>
+            <version>${version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>${okhttp.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>${jsoup.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-boot-starter</artifactId>
+            <version>${mybatis-plus-boot-starter.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.github.binarywang</groupId>
+            <artifactId>weixin-java-mp</artifactId>
+            <version>${weixin-java-mp.version}</version>
+        </dependency>
+        <!-- netty -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>${netty-all.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>${hutool.version}</version>
+        </dependency>
+        <!-- MyBatis-->
+        <dependency>
+            <groupId>org.mybatis</groupId>
+            <artifactId>mybatis</artifactId>
+            <version>${mybatis.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-generator</artifactId>
+            <version>${mybatis-plus-generator.version}</version>
+        </dependency>
+        <!--Mysql数据库驱动-->
+        <dependency>
+            <groupId>mysql</groupId>
+            <artifactId>mysql-connector-java</artifactId>
+            <version>${mysql-connector.version}</version>
+        </dependency>
+        <!--JWT(Json Web Token)登录支持-->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt</artifactId>
+            <version>${jjwt.version}</version>
+        </dependency>
+        <!-- 阿里云OSS -->
+        <dependency>
+            <groupId>io.minio</groupId>
+            <artifactId>minio</artifactId>
+            <version>${minio.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson-spring-boot-starter</artifactId>
+            <version>${redisson-spring-boot-starter.version}</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+```
+
+`luochat-common-starter的pom`
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-aop</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>cn.hutool</groupId>
+        <artifactId>hutool-all</artifactId>
+    </dependency>
+    <!-- MyBatis-->
+    <dependency>
+        <groupId>com.baomidou</groupId>
+        <artifactId>mybatis-plus-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.velocity</groupId>
+        <artifactId>velocity-engine-core</artifactId>
+        <version>2.0</version>
+    </dependency>
+    <!--Mysql数据库驱动-->
+    <dependency>
+        <groupId>mysql</groupId>
+        <artifactId>mysql-connector-java</artifactId>
+    </dependency>
+    <!-- netty -->
+    <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-all</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.github.xiaoymin</groupId>
+        <!--使用Swagger2-->
+        <artifactId>knife4j-spring-boot-starter</artifactId>
+        <version>2.0.9</version>
+    </dependency>    
+</dependencies>
+```
+
+`luochat-chat-server的application.yml`
+
+```yml
+spring:
+  profiles:
+    #运行的环境
+    active: test
+  application:
+    name: luochat
+  datasource:
+    url: jdbc:mysql://${luochat.mysql.ip}:${luochat.mysql.port}/${luochat.mysql.db}?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+    username: ${luochat.mysql.username}
+    password: ${luochat.mysql.password}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  redis:
+    # Redis服务器地址
+    host: ${luochat.redis.host}
+    # Redis服务器端口号
+    port: ${luochat.redis.port}
+    # 使用的数据库索引，默认是0
+    database: 0
+    # 连接超时时间
+    timeout: 1800000
+    # 设置密码
+    password: ${luochat.redis.password}
+  jackson:
+    serialization:
+      write-dates-as-timestamps: true
+```
+
+`luochat-chat-server的application-test.properties`
+
+```properties
+##################mysql配置##################
+luochat.mysql.ip=192.168.253.128
+luochat.mysql.port=3306
+luochat.mysql.db=luochat
+luochat.mysql.username=root
+luochat.mysql.password=123
+##################redis配置##################
+luochat.redis.host=192.168.253.128
+luochat.redis.port=6379
+luochat.redis.password=123
+```
+
+
+
+## netty实现websocket 
+
+### 编码
+
+![image-20240101193214983](assets/image-20240101193214983.png)
+
+**NettyWebSocketServer**
+
+```java
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
+import io.netty.handler.stream.ChunkedWriteHandler;
+import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.util.NettyRuntime;
+import io.netty.util.concurrent.Future;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Configuration;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/1 12:37
+ */
+@Slf4j
+@Configuration
+public class NettyWebSocketServer {
+    public static final int WEB_SOCKET_PORT = 8090;
+    public static final NettyWebSocketServerHandler NETTY_WEB_SOCKET_SERVER_HANDLER = new NettyWebSocketServerHandler();
+    // 创建线程池执行器
+    private EventLoopGroup bossGroup = new NioEventLoopGroup(1);
+    private EventLoopGroup workerGroup = new NioEventLoopGroup(NettyRuntime.availableProcessors());
+
+    /**
+     * 启动 ws server
+     *
+     * @return
+     * @throws InterruptedException
+     */
+    @PostConstruct
+    public void start() throws InterruptedException {
+        run();
+    }
+
+    /**
+     * 销毁
+     */
+    @PreDestroy
+    public void destroy() {
+        Future<?> future = bossGroup.shutdownGracefully();
+        Future<?> future1 = workerGroup.shutdownGracefully();
+        future.syncUninterruptibly();
+        future1.syncUninterruptibly();
+        log.info("关闭 ws server 成功");
+    }
+
+    public void run() throws InterruptedException {
+        // 服务器启动引导对象
+        ServerBootstrap serverBootstrap = new ServerBootstrap();
+        serverBootstrap.group(bossGroup, workerGroup)
+                .channel(NioServerSocketChannel.class)
+                .option(ChannelOption.SO_BACKLOG, 128)
+                .option(ChannelOption.SO_KEEPALIVE, true)
+                .handler(new LoggingHandler(LogLevel.INFO)) // 为 bossGroup 添加 日志处理器
+                .childHandler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel socketChannel) throws Exception {
+                        ChannelPipeline pipeline = socketChannel.pipeline();
+                        //30秒客户端没有向服务器发送心跳则关闭连接
+                        // pipeline.addLast(new IdleStateHandler(30, 0, 0));
+                        // 因为使用http协议，所以需要使用http的编码器，解码器
+                        pipeline.addLast(new HttpServerCodec());
+                        // 以块方式写，添加 chunkedWriter 处理器
+                        pipeline.addLast(new ChunkedWriteHandler());
+                        /**
+                         * 说明：
+                         *  1. http数据在传输过程中是分段的，HttpObjectAggregator可以把多个段聚合起来；
+                         *  2. 这就是为什么当浏览器发送大量数据时，就会发出多次 http请求的原因
+                         */
+                        pipeline.addLast(new HttpObjectAggregator(8192));
+                        //保存用户ip
+                        // pipeline.addLast(new HttpHeadersHandler());
+                        /**
+                         * 说明：
+                         *  1. 对于 WebSocket，它的数据是以帧frame 的形式传递的；
+                         *  2. 可以看到 WebSocketFrame 下面有6个子类
+                         *  3. 浏览器发送请求时： ws://localhost:7000/hello 表示请求的uri
+                         *  4. WebSocketServerProtocolHandler 核心功能是把 http协议升级为 ws 协议，保持长连接；
+                         *      是通过一个状态码 101 来切换的
+                         */
+                        pipeline.addLast(new WebSocketServerProtocolHandler("/"));
+                        // 自定义handler ，处理业务逻辑
+                        pipeline.addLast(NETTY_WEB_SOCKET_SERVER_HANDLER);
+                    }
+                });
+        // 启动服务器，监听端口，阻塞直到启动成功
+        serverBootstrap.bind(WEB_SOCKET_PORT).sync();
+    }
+
+}
+```
+
+明白了websocket的升级过程，对netty的处理的就比较简单了。websocket初期是通过http请求，进行升级，建立双方的连接。
+
+1.所以编解码器需要用到`HttpServerCodec`
+
+2.`WebSocketServerProtocolHandler`是netty进行websocket升级的处理器。在这期间会抹除http相关的信息，比如请求头啥的。如果想获取相关信息，需要在这之前获取。
+
+3.`HttpHeadersHandler`是我们自己的处理器。赶在websocket升级之前，获取用户的ip地址，然后保存到channel的附件里。
+
+4.`NettyWebSocketServerHandler`是我们的业务处理器，里面处理客户端的事件。
+
+5.`IdleStateHandler`实现心跳检测。
+
+**NettyWebSocketServerHandler**
+
+```java
+import io.netty.channel.ChannelHandler.Sharable;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/1 12:37
+ */
+@Slf4j
+@Sharable
+public class NettyWebSocketServerHandler extends SimpleChannelInboundHandler<TextWebSocketFrame> {
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, TextWebSocketFrame msg) throws Exception {
+        String text = msg.text();
+        System.out.println(text);
+    }
+}
+```
+
+除了`NettyWebSocketServerHandler`是无状态的（必须要加上`@Sharable`，这是netty提供的一个标识，代表所有的pipeline可以共用它，不然后台没有检测到会报错），其他处理器都是有状态的（也就是这些处理器是不能共用的）
+
+**LuoChatCustomApplication**
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.web.servlet.ServletComponentScan;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/1 12:37
+ */
+@SpringBootApplication(scanBasePackages = {"com.luoying.luochat"})
+@ServletComponentScan
+public class LuoChatCustomApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(LuoChatCustomApplication.class,args);
+    }
+
+}
+```
+
+启动主类后，使用apipost来测试
+
+![image-20240101195332817](assets/image-20240101195332817.png)
+
+![image-20240101200150766](assets/image-20240101200150766.png)
+
+**流程：**
+
+发起连接时，会向netty服务器发起http请求，服务器的initChannel方法会对对http请求进行一个协议的转换，转换成WebSocket协议，然后本地的业务处理器就可以处理请求
+
+
+
+### 原理
+
+点进`WebSocketServerProtocolHandler`的源码
+
+![image-20240101201517463](assets/image-20240101201517463.png)
+
+点进`WebSocketServerProtocolHandshakeHandler`
+
+![image-20240101201834457](assets/image-20240101201834457.png)
+
+![image-20240101204003449](assets/image-20240101204003449.png)
+
+![image-20240101204053952](assets/image-20240101204053952.png)
+
+
+
+## websocket前后端交互协议
+
+### 协议
+
+我们用websocket的目的，主要是用于后端推送前端，前端能用http的就尽量用http。这样的好处是，http丰富的拦截器，注解，请求头等功能，可以更好地实现或者是收口我们想要的功能。尽量对websocket的依赖降到最低。
+
+前后端的交互用的是json串，里面通过type标识次此次的事件类型。
+
+**前端请求示例**
+
+```json
+{
+type:1,//1.请求登录二维码，2.心跳检测 3.用户认证
+data:{}
+}
+```
+
+- 请求登录二维码
+
+发送type=1从后端请求一个登录二维码
+
+- 心跳包
+
+前端连接websocket后，需要**10**s发送一次心跳包消息。
+
+- 用户认证
+
+用户在刷新后，连接会断开。前端拿着本地存储的token来对连接进行认证，证明这个连接的所有者是个已登录用户
+
+```json
+{
+type:3,
+data:{
+    token:asdajsfhjda//用户的登录凭证，每次请求携带，不需要加Bearer前缀
+    }
+}
+```
+
+**后端返回示例**（既有主动返回，也有被动返回）
+
+```json
+{
+  type:1//1.登录返回二维码 2.用户扫描成功等待授权 3.用户登录成功返回用户信息 4.收到消息 5.上下线推送6.前端token失效 7.拉黑用户（隐藏它的所有消息）
+  data:jsondata//根据不同的类型有不同的返回对象
+}
+
+```
+
+### 编码
+
+![image-20240101215901550](assets/image-20240101215901550.png)
+
+**编写基本的websocket请求，响应类**
+
+```java
+import lombok.Data;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/1 21:24
+ */
+@Data
+public class WSBaseReq {
+    /**
+     * @see com.luoying.luochat.common.websocket.domain.enums.WSReqTypeEnum
+     */
+    private Integer type;
+
+    private String data;
+}
+```
+
+```java
+import lombok.Data;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/1 21:30
+ */
+@Data
+public class WSBaseResp<T> {
+    /**
+     * @see com.luoying.luochat.common.websocket.domain.enums.WSRespTypeEnum
+     */
+    private Integer type;
+
+    private T data;
+}
+```
+
+![image-20240101220343687](assets/image-20240101220343687.png)
+
+**复制原项目的`WSReqTypeEnum`，`WSRespTypeEnum`**
+
+![image-20240101220427861](assets/image-20240101220427861.png)
+
+**复制原项目提供的后端返回类**
+
+![image-20240101220710452](assets/image-20240101220710452.png)
+
+**业务处理器中添加业务逻辑**
+
+![image-20240101221344459](assets/image-20240101221344459.png)
+
+![image-20240101221434141](assets/image-20240101221434141.png)
+
+![image-20240101221458226](assets/image-20240101221458226.png)
+
+![image-20240101221512771](assets/image-20240101221512771.png)
