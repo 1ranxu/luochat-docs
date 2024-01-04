@@ -204,7 +204,7 @@ services:
     ports:
       - 3306:3306
     environment:
-      MYSQL_ROOT_PASSWORD: 123 #root用户密码
+      MYSQL_ROOT_PASSWORD: 115474287zxcczld #root用户密码
       TZ: Asia/Shanghai
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
 ```
@@ -1415,7 +1415,25 @@ luochat-chat-server引入common包
         <!--使用Swagger2-->
         <artifactId>knife4j-spring-boot-starter</artifactId>
         <version>2.0.9</version>
+    </dependency>  
+    <!-- test -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-test</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>junit</groupId>
+        <artifactId>junit</artifactId>
     </dependency>    
+    <dependency>
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-test</artifactId>
+    </dependency> 
+    <!-- redis -->
+    <dependency>
+    	<groupId>org.springframework.boot</groupId>
+    	<artifactId>spring-boot-starter-data-redis</artifactId>
+	</dependency>
 </dependencies>
 ```
 
@@ -1630,7 +1648,6 @@ import org.springframework.boot.web.servlet.ServletComponentScan;
  * @Date 2024/1/1 12:37
  */
 @SpringBootApplication(scanBasePackages = {"com.luoying.luochat"})
-@ServletComponentScan
 public class LuoChatCustomApplication {
 
     public static void main(String[] args) {
@@ -1777,3 +1794,3051 @@ public class WSBaseResp<T> {
 ![image-20240101221458226](assets/image-20240101221458226.png)
 
 ![image-20240101221512771](assets/image-20240101221512771.png)
+
+
+
+## netty心跳原理
+
+如果用户突然关闭网页，是不会有断开通知给服务端的。那么服务端永远感知不到用户下线。因此需要客户端维持一个心跳，当指定时间没有心跳，服务端主动断开，进行用户下线操作。
+
+直接接入netty的现有组件`new IdleStateHandler(30, 0, 0)`可以实现30秒链接没有读请求，就主动关闭链接。我们的web前端需要保持每10s发送一个心跳包。
+
+![image-20240102110925174](assets/image-20240102110925174.png)
+
+![image-20240102110655716](assets/image-20240102110655716.png)
+
+
+
+**点进`IdleStateHandler`的源码**
+
+![image-20240102113105209](assets/image-20240102113105209.png)
+
+![image-20240102114124513](assets/image-20240102114124513.png)
+
+
+
+# 用户模块
+
+## 用户表设计
+
+```sql
+CREATE TABLE `user` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT '用户id',
+  `name` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '用户昵称',
+  `avatar` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '用户头像',
+  `sex` int(11) DEFAULT NULL COMMENT '性别 1为男性，2为女性',
+  `open_id` char(32) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '微信openid用户标识',
+  `active_status` int(11) DEFAULT '2' COMMENT '在线状态 1在线 2离线',
+  `last_opt_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '最后上下线时间',
+  `ip_info` json DEFAULT NULL COMMENT 'ip信息',
+  `item_id` bigint(20) DEFAULT NULL COMMENT '佩戴的徽章id',
+  `status` int(11) DEFAULT '0' COMMENT '使用状态 0.正常 1拉黑',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE KEY `uniq_open_id` (`open_id`) USING BTREE,
+  UNIQUE KEY `uniq_name` (`name`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE,
+  KEY `idx_active_status_last_opt_time` (`active_status`,`last_opt_time`)
+) ENGINE=InnoDB AUTO_INCREMENT=11000 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='用户表';
+```
+
+用户表主要满足几个场景：
+
+- **用户登录**
+
+用户登录采用的微信扫码登录，需要保存微信的`open_id`，以及通过微信授权后获得的用户`name`，`avatar`，`sex`等
+
+- **用户在线管理**
+
+`active_status`来保存用户是否在线的信息。
+
+`last_opt_time`保存用户最后一次上下线的时间，用于群成员排序。
+
+- **ip归属地**
+
+`ip_info`是json类型的字段，用来存ip相关的信息，以及解析后的地区。
+
+- **徽章**
+
+`item_id`保存用户佩戴的徽章
+
+- **黑名单**
+
+防止有小黑子发敏感言论，设置了黑名单功能，可拉黑用户。通过`status`来表示。
+
+
+
+## mp代码生成器使用
+
+简单的crud，应该快速的去生成，减少我们的时间，提高我们的效率。
+
+由于我们项目用的是mybatisplus，直接用官方的代码生成器即可。为了适配项目的结构，我做了一些改动。
+
+### 引入依赖
+
+`luochat-chat-server的pom`
+
+```xml
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-generator</artifactId>
+    <exclusions>
+        <exclusion>
+            <artifactId>mybatis-plus-extension</artifactId>
+            <groupId>com.baomidou</groupId>
+        </exclusion>
+    </exclusions>
+</dependency>
+```
+
+### 创建代码生成器模板
+
+复制下面这段代码，在项目的test包下创建一个类
+
+```java
+import com.baomidou.mybatisplus.annotation.DbType;
+import com.baomidou.mybatisplus.annotation.FieldFill;
+import com.baomidou.mybatisplus.generator.AutoGenerator;
+import com.baomidou.mybatisplus.generator.config.DataSourceConfig;
+import com.baomidou.mybatisplus.generator.config.GlobalConfig;
+import com.baomidou.mybatisplus.generator.config.PackageConfig;
+import com.baomidou.mybatisplus.generator.config.StrategyConfig;
+import com.baomidou.mybatisplus.generator.config.po.TableFill;
+import com.baomidou.mybatisplus.generator.config.rules.NamingStrategy;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class MPGenerator {
+    public static void main(String[] args) {
+        //代码生成器
+        AutoGenerator autoGenerator = new AutoGenerator();
+
+        //数据源配置
+        DataSourceConfig dataSourceConfig = new DataSourceConfig();
+        dataSourceConfig.setDbType(DbType.MYSQL);//指定数据库类型
+        //---------------------------数据源-----------------------------------
+        assembleDev(dataSourceConfig);//配置数据源
+        autoGenerator.setDataSource(dataSourceConfig);
+
+        //全局配置
+        GlobalConfig globalConfig = new GlobalConfig();
+        globalConfig.setOpen(false);
+        //todo 要改输出路径
+        globalConfig.setOutputDir(System.getProperty("user.dir") + "/luochat-chat-server/src/main/java");
+        //设置作者名字
+        globalConfig.setAuthor("<a href=\"https://github.com/1ranxu\">luoying</a>");
+        //去掉service的I前缀,一般只需要设置service就行
+        globalConfig.setServiceImplName("%sDao");
+        autoGenerator.setGlobalConfig(globalConfig);
+
+        //包配置
+        PackageConfig packageConfig = new PackageConfig();
+        packageConfig.setParent("com.luoying.luochat.common.user");//自定义包的路径
+        packageConfig.setEntity("domain.entity");
+        packageConfig.setMapper("mapper");
+        packageConfig.setController("controller");
+        packageConfig.setServiceImpl("dao");
+        autoGenerator.setPackageInfo(packageConfig);
+
+        //策略配置
+        StrategyConfig strategyConfig = new StrategyConfig();
+        //是否使用Lombok
+        strategyConfig.setEntityLombokModel(true);
+        //包，列的命名规则，使用驼峰规则
+        strategyConfig.setNaming(NamingStrategy.underline_to_camel);
+//        strategyConfig.setTablePrefix("t_");
+        strategyConfig.setColumnNaming(NamingStrategy.underline_to_camel);
+        //字段和表注解
+        strategyConfig.setEntityTableFieldAnnotationEnable(true);
+        //todo 这里修改需要自动生成的表结构
+        strategyConfig.setInclude(
+                "user"
+        );
+        //自动填充字段,在项目开发过程中,例如创建时间，修改时间,每次，都需要我们来指定，太麻烦了,设置为自动填充规则，就不需要我们赋值咯
+        List<TableFill> list = new ArrayList<TableFill>();
+        TableFill tableFill1 = new TableFill("create_time", FieldFill.INSERT);
+        TableFill tableFill2 = new TableFill("update_time", FieldFill.INSERT_UPDATE);
+        list.add(tableFill1);
+        list.add(tableFill2);
+
+		//strategyConfig.setTableFillList(list);
+        autoGenerator.setStrategy(strategyConfig);
+
+        //执行
+        autoGenerator.execute();
+
+    }
+    //todo 这里修改你的数据源
+    public static void assembleDev(DataSourceConfig dataSourceConfig) {
+        dataSourceConfig.setDriverName("com.mysql.cj.jdbc.Driver");
+        dataSourceConfig.setUsername("root");
+        dataSourceConfig.setPassword("115474287zxcczld");
+        dataSourceConfig.setUrl("jdbc:mysql://192.168.253.128:3306/luochat?useUnicode=true&characterEncoding=utf-8&useSSL=true&serverTimezone=UTC");
+    }
+}
+```
+
+![image-20240102122129520](assets/image-20240102122129520.png)
+
+我们只需要修改，`表`和`数据源`即可
+
+### 执行生成
+
+![image-20240102122444101](assets/image-20240102122444101.png)
+
+![image-20240102144932812](assets/image-20240102144932812.png)
+
+![image-20240102145459406](assets/image-20240102145459406.png)
+
+![image-20240102145051155](assets/image-20240102145051155.png)
+
+
+
+## 扫码登录方案选型
+
+一个正经的项目肯定是需要登录的，这样才能通过登录态去限制用户的一些行为，提高不安定用户的捣乱门槛。但是项目也不应该处处强制登录，这样只会赶走想要尝试的用户！
+
+我们的聊天室，当然要打造最佳的用户体验。只有发消息需要用户登录，其他的成员列表、消息列表，未登录都可以看见。
+
+那么微信登录要如何实现呢？先来比对业界几种常见方案，然后再针对我们的方案做详细的技术讲解。
+
+
+
+### 扫公众号事件码+手机号注册
+
+这种支持扫码或者短信登录的，如果我为了方便不接验证码，选择扫码登录，登录成功后还会要求我绑定手机，非常难受。
+
+![image-20240102150555291](assets/image-20240102150555291.png)
+
+![image-20240102150631597](assets/image-20240102150631597.png)
+
+![image-20240102150647706](assets/image-20240102150647706.png)
+
+### 扫公众号事件码+授权
+
+wps就采用这样的登录方式
+
+1.通过扫描一个携带参数的二维码类似`https://qrcode.wx.com?code=123`
+
+2.关注公众号后。后端会收到扫码用户的事件消息，里面有`open_id`以及事件码`123`
+
+3.如果是一个未注册过的用户，为了获取用户昵称和头像，公众号会主动推送一个链接，用户点击授权后，就能获取用户信息。
+
+但这种方式需要企业认证的公众号才能做
+
+![image-20240102151913858](assets/image-20240102151913858.png)
+
+![image-20240102151927625](assets/image-20240102151927625.png)
+
+### 公众号获取事件码+网站填写事件号
+
+以鱼皮的编程导航为例，扫的是一张普通的公众号二维码，里面没有附带任何信息。
+
+![image-20240102151959378](assets/image-20240102151959378.png)
+
+关注后会给一个动态码。同时后端也会记录对应的`关注事件`的`open_id`。
+
+![image-20240102152018429](assets/image-20240102152018429.png)
+
+将动态码写入网站的登录框，就完成了微信`open_id`和网站用户的绑定、
+
+
+
+### 网站展示事件码+公众号填写事件号
+
+再看看技术派的实现
+
+用户跟随指示，在公众号输入对应的事件码，然后后端收到消息，里面携带了用户的`open_id`和`事件码`，完成用户的绑定。
+
+![image-20240102152110814](assets/image-20240102152110814.png)
+
+![image-20240102152249651](assets/image-20240102152249651.png)
+
+### 总结
+
+事件码的作用和验证码一样，用来标识是本人操作。其实在哪里填这个事件码都一样，但是编程导航是在网站填写事件码。容易被小黑子暴力撞库，正好撞上了一个刚关注的用户。所以给的事件码就会比较复杂。而技术派由于是公众号内回复，所以可以准备一批简单的事件码比如666，888的数字，让用户去填，比较安全。
+
+为了用户最好的体验，不需要手动输入任何信息，采用第二种方案，我们可以用测试公众号
+
+
+
+## Token认证技术方案选型
+
+### Token 生成方式
+
+Token 的生成方式通常有以下几种：
+
+- 随机字符串：可以使用一些随机数生成算法，如 **UUID**、**Snowflake** 等来生成一个随机的字符串作为 Token。由于随机字符串本身就是随机分布的，因此具有很高的安全性。
+- **JWT**（JSON Web Token）：JWT 是一种基于 JSON 格式的开放标准（RFC 7519），用于在多方之间安全地传输信息。它将用户身份信息和权限等相关信息编码成一个 JSON 对象，并通过数字签名或者加密等方式进行验证和保护。JWT 除了可以用于 Token 登录外，还可以用于 API 认证、单点登录等场景。
+- **SessionID**。
+
+通常的Token在服务器端的实现方式有这几个：
+
+1. 用SessionID实现Token的功能
+2. 使用Json Web Token (JWT)
+3. 中心化存储Token
+
+
+
+### Cookie + Session 登录
+
+大家都知道，HTTP 是一种无状态的协议。
+
+无状态是指协议对于事务处理没有记忆能力，服务器不知道客户端是什么状态。即用户给服务器发送 HTTP 请求之后，服务器根据请求返回数据，但不会记录任何信息（比如发起请求的用户信息）。
+
+为了解决 HTTP 无状态的问题，出现了 Cookie。
+
+Cookie 是服务器端发送给客户端的一段特殊信息，这些信息以文本的方式存放在客户端，客户端每次向服务器端发送请求时都会带上这些特殊信息。
+
+1. 前端输入账号密码，提交给后端
+2. 后端验证成功后，创建一个`Session`。`Session`是一种服务器端保存用户会话信息的机制，用于识别多次请求之间的逻辑关系。
+3. 后端将`Session ID`（通常是一个随机的字符串）返回给前端，并通过 `Cookie` 的方式将`Session ID`保存在浏览器中。这样就可以保证当用户再次发送请求时，后端可以通过该 `Session ID `来识别用户身份，并完成相关的操作。
+4. 在后续的请求中，浏览器会自动将保存的 `Cookie `信息发送到后端进行验证，如果` Session ID`有效，则返回相应的数据。如果 `Session ID `失效或者不存在，则需要重新登录获取新的 `Session ID`。
+5. 用户退出时，后端要删除对应的`Session`信息
+
+#### cookie的设置原理
+
+cookie的简单之处，在于前端是无感知的，无需开发者额外开发。这是http协议的约定，后端可以通过返回的报文，将cookie设置进网页，网页下次请求也会自动携带。`SetCookie` 命令
+
+![image-20240104103508111](assets/image-20240104103508111.png)
+
+#### 缺点
+
+- 跨域问题：Cookie 是和某个域名相关联的，只能在同域名下共享，因为它请求的是使用某个域名的服务器，如果访问另一个域名，就不会携带之前的Cookie ，因此跨域访问时无法访问到对应的服务器中的session信息。这时，可能需要采用一些其他的跨域解决方案，如 JSONP、CORS 等。
+- 扩展性问题：由于 Session 信息存储在服务器端，当系统扩展到多台服务器时，需要采用一些集中式的 Session 管理方案，否则会出现 Session 不一致或者丢失等问题。
+- 一些移动设备和浏览器可能会禁用 Cookie 和 Session 机制，这会导致无法正常登录
+
+#### 总结
+
+- 给浏览器的`sessionID`其实就相当于是一个`token`，只不过前端是无感知的设置进`cookie`的，这种方案 通常适用于后台。
+- 由于cookie的一些限制，这个token最好还是由前端**主动保存**，比如保存到**localStorage**。登录的时候主动携带在**请求头**中。
+- 由于现在都是集群部署，token的关系保存，最好是**集中化管理**，或者**无状态化管理**
+
+
+
+### JWT实现Token
+
+简单来说JWT就是通过可逆加密算法，生成一串包含用户、过期时间等关键信息的Token，每次请求携带Token，服务器拿到这个Token解密出来就能得到用户信息，从而判断用户状态。
+
+#### 优点
+
+1. JWT的最大特点是**服务器不保存会话状态，**无论哪个服务器**解析**出来的Token信息都一样，而且不需要做任何查询操作，省掉了数据库/Redis的开销
+
+#### 缺点
+
+1. 因为JWT的特点，使用期间不可能取消令牌或更改令牌的权限，一旦JWT签发，在有效期内将会一直有效。
+2. 无法主动更新Token的有效性，只要用户传回来的Token没有过期，服务器就会认为这个用户操作是有效的。比如一下这个场景：某用户被封禁，此时该用户所有操作都应该被禁止，但是由于之前发给用户的JWT Token还没有过期，服务器仍然认为该用户操作合法。有一个解决方案是维护一张JWT黑名单表，只有没在表上的用户的JWT是有效的。**但是随之而来又有一个问题便是这个JWT黑名单表存在哪里？存在服务器，那么又要搞多服务器同步；存在关系数据库，那么查数据库效率又低。存在Redis，则又回到了Token丢失问题。** 
+3. 解析JWT Token也是消耗服务器CPU的
+
+#### 总结
+
+1. 由于jwt是无状态的，它一经发布，就意味着固定了过期时间。我们没法对他做**失效**，没法实现**续期**，它的好处也是显而易见的。不需要任何一个中心化的地方去保存它，管理它，查询它，比对它。
+
+
+
+### 双token方案
+
+双token是为了**解决jwt的续期**问题的。由于jwt一颁布，就意味着在指定时间内能够通行。
+
+1. 如果给的有**效期过长**，风险是比较大的，服务器失去了掌控力。在这期间如果想让用户失效，或者是有人盗取了token。都可以胡作非为好久。
+2. 如果给的有**效期过短**，用户经常需要重新登录，体验也很不好。
+3. 如果**中心化管理**用户状态，也就是每次解析jwt token之后，还需要到中心库比对能否通过。这样又违背了初衷。增加每次**认证的耗时**
+
+双token分为`access_token`和`refresh_token`。一般`access_token`的有效期可以设置为10分钟，`refresh_token`的有效期可以设置为7天。用户每次请求都用`access_token`，如果前端发现请求401，也就是过期了，就用`refresh_token`去重新申请一个`access_token`。继续请求。
+
+这里的关键在于，`refresh_token`申请`access_token`的时候，用户是无感知的，前后端的框架自动去更新这个新的`access_token`。
+
+还有一个点在申请`access_token`的时候，后端这时候会去校验用户的状态等问题，如果发现用户被禁用了，就申请不到token了。
+
+#### 总结
+
+双token是一个多方平衡的完美方案。它希望对用户的认证有所**掌控**，又不希望每次的检验会增加**耗时**。它不想给用户**过长的授权时间**，又不想用户因此**频繁登录**影响体验。因此变成了每当`access_token`过期后，服务器都会重新掌控局面，进行重新认证的复杂判断。
+
+
+
+### 中心管理token
+
+JWT碰巧有去中心化的特性，但为了能够控制它的**上下线**，**主动下线** ，**登录续期**等功能。我们依然可以对它进行中心化的管理。
+
+使用redis中心化管理uid -> token的信息。确保一个uid只有一个有效的token。用户登录后，每一次认证都会从token中解析出uid，并请求redis进行token比对。并且异步判断有效期小于一天，进行续期。
+
+选择用JWT的话，因为正好包含了uid，可以让前端传起来方便
+
+
+
+
+
+## 集成微信登录SDK
+
+微信文档
+
+[请求凭证](https://developers.weixin.qq.com/doc/offiaccount/Basic_Information/Get_access_token.html)
+
+[带参二维码](https://developers.weixin.qq.com/doc/offiaccount/Account_Management/Generating_a_Parametric_QR_Code.html)
+
+[用户授权](https://developers.weixin.qq.com/doc/offiaccount/OA_Web_Apps/Wechat_webpage_authorization.html)
+
+我们采用微信登录，有好多需要对接的微信接口。如果要为每一个请求去列举一个url。两个出入参实体类。可就太麻烦了。
+
+我们可以直接引入Binary Wang大神的sdk。
+
+### 引入依赖
+
+`luochat-chat-server的pom`
+
+```xml
+<dependency>
+    <groupId>com.github.binarywang</groupId>
+    <artifactId>weixin-java-mp</artifactId>
+    <version>4.4.0</version>
+</dependency>
+```
+
+
+
+### 配置文件
+
+![image-20240102161833423](assets/image-20240102161833423.png)
+
+```java
+package com.luoying.luochat.common.user.config;
+
+import com.luoying.luochat.common.user.service.handler.LogHandler;
+import com.luoying.luochat.common.user.service.handler.MsgHandler;
+import com.luoying.luochat.common.user.service.handler.ScanHandler;
+import com.luoying.luochat.common.user.service.handler.SubscribeHandler;
+import lombok.AllArgsConstructor;
+import me.chanjar.weixin.mp.api.WxMpMessageRouter;
+import me.chanjar.weixin.mp.api.WxMpService;
+import me.chanjar.weixin.mp.api.impl.WxMpServiceImpl;
+import me.chanjar.weixin.mp.config.impl.WxMpDefaultConfigImpl;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+import static me.chanjar.weixin.common.api.WxConsts.EventType;
+import static me.chanjar.weixin.common.api.WxConsts.EventType.SUBSCRIBE;
+import static me.chanjar.weixin.common.api.WxConsts.XmlMsgType.EVENT;
+
+/**
+ * wechat mp configuration
+ *
+ * @author <a href="https://github.com/binarywang">Binary Wang</a>
+ */
+@AllArgsConstructor
+@Configuration
+@EnableConfigurationProperties(WxMpProperties.class)
+public class WxMpConfiguration {
+    private final LogHandler logHandler;
+    private final MsgHandler msgHandler;
+    private final SubscribeHandler subscribeHandler;
+    private final ScanHandler scanHandler;
+    private final WxMpProperties properties;
+
+    @Bean
+    public WxMpService wxMpService() {
+        // 代码里 getConfigs()处报错的同学，请注意仔细阅读项目说明，你的IDE需要引入lombok插件！！！！
+        final List<WxMpProperties.MpConfig> configs = this.properties.getConfigs();
+        if (configs == null) {
+            throw new RuntimeException("大哥，拜托先看下项目首页的说明（readme文件），添加下相关配置，注意别配错了！");
+        }
+
+        WxMpService service = new WxMpServiceImpl();
+        service.setMultiConfigStorages(configs.stream().map(a -> {
+            WxMpDefaultConfigImpl configStorage;
+            configStorage = new WxMpDefaultConfigImpl();
+
+            configStorage.setAppId(a.getAppId());
+            configStorage.setSecret(a.getSecret());
+            configStorage.setToken(a.getToken());
+            configStorage.setAesKey(a.getAesKey());
+            return configStorage;
+        }).collect(Collectors.toMap(WxMpDefaultConfigImpl::getAppId, a -> a, (o, n) -> o)));
+        return service;
+    }
+
+    @Bean
+    public WxMpMessageRouter messageRouter(WxMpService wxMpService) {
+        final WxMpMessageRouter newRouter = new WxMpMessageRouter(wxMpService);
+
+        // 记录所有事件的日志 （异步执行）
+        newRouter.rule().handler(this.logHandler).next();
+
+        // 关注事件
+        newRouter.rule().async(false).msgType(EVENT).event(SUBSCRIBE).handler(this.subscribeHandler).end();
+
+        // 扫码事件
+        newRouter.rule().async(false).msgType(EVENT).event(EventType.SCAN).handler(this.scanHandler).end();
+
+        // 默认
+        newRouter.rule().async(false).handler(this.msgHandler).end();
+
+        return newRouter;
+    }
+
+}
+```
+
+```java
+import cn.hutool.json.JSONUtil;
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+import java.util.List;
+
+/**
+ * wechat mp properties
+ *
+ * @author <a href="https://github.com/binarywang">Binary Wang</a>
+ */
+@Data
+@ConfigurationProperties(prefix = "wx.mp")
+public class WxMpProperties {
+    /**
+     * 是否使用redis存储access token
+     */
+    private boolean useRedis;
+
+    /**
+     * 多个公众号配置信息
+     */
+    private List<MpConfig> configs;
+
+    @Data
+    public static class MpConfig {
+        /**
+         * 设置微信公众号的appid
+         */
+        private String appId;
+
+        /**
+         * 设置微信公众号的app secret
+         */
+        private String secret;
+
+        /**
+         * 设置微信公众号的token
+         */
+        private String token;
+
+        /**
+         * 设置微信公众号的EncodingAESKey
+         */
+        private String aesKey;
+    }
+
+    @Override
+    public String toString() {
+        return JSONUtil.toJsonStr(this);
+    }
+}
+```
+
+
+
+### 配置消息处理器
+
+这些消息处理器是从原项目复制过来的，因为有些类还没有创建，等到需要的时候才会创建，所以需要把一些报错的地方删除
+
+![image-20240102162247608](assets/image-20240102162247608.png)
+
+```java
+import me.chanjar.weixin.mp.api.WxMpMessageHandler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ */
+public abstract class AbstractHandler implements WxMpMessageHandler {
+    protected Logger logger = LoggerFactory.getLogger(getClass());
+}
+```
+
+```java
+import cn.hutool.json.JSONUtil;
+import lombok.extern.slf4j.Slf4j;
+import me.chanjar.weixin.common.session.WxSessionManager;
+import me.chanjar.weixin.mp.api.WxMpService;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlMessage;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlOutMessage;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+/**
+ */
+@Component
+@Slf4j
+public class LogHandler extends AbstractHandler {
+    @Override
+    public WxMpXmlOutMessage handle(WxMpXmlMessage wxMessage,
+                                    Map<String, Object> context, WxMpService wxMpService,
+                                    WxSessionManager sessionManager) {
+        log.info("\n接收到请求消息，内容：{}", JSONUtil.toJsonStr(wxMessage));
+        return null;
+    }
+
+}
+```
+
+```java
+import cn.hutool.json.JSONUtil;
+import me.chanjar.weixin.common.error.WxErrorException;
+import me.chanjar.weixin.common.session.WxSessionManager;
+import me.chanjar.weixin.mp.api.WxMpService;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlMessage;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlOutMessage;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+import static me.chanjar.weixin.common.api.WxConsts.XmlMsgType;
+
+/**
+ *
+ */
+@Component
+public class MsgHandler extends AbstractHandler {
+
+
+    @Override
+    public WxMpXmlOutMessage handle(WxMpXmlMessage wxMessage,
+                                    Map<String, Object> context, WxMpService weixinService,
+                                    WxSessionManager sessionManager) {
+        if (true) {
+            return null;
+        }
+        if (!wxMessage.getMsgType().equals(XmlMsgType.EVENT)) {
+            //可以选择将消息保存到本地
+        }
+
+        //当用户输入关键词如“你好”，“客服”等，并且有客服在线时，把消息转发给在线客服
+        try {
+            if (StringUtils.startsWithAny(wxMessage.getContent(), "你好", "客服")
+                    && weixinService.getKefuService().kfOnlineList()
+                    .getKfOnlineList().size() > 0) {
+                return WxMpXmlOutMessage.TRANSFER_CUSTOMER_SERVICE()
+                        .fromUser(wxMessage.getToUser())
+                        .toUser(wxMessage.getFromUser()).build();
+            }
+        } catch (WxErrorException e) {
+            e.printStackTrace();
+        }
+
+        //组装回复消息
+        String content = "收到信息内容：" + JSONUtil.toJsonStr(wxMessage);
+
+        return null;
+
+    }
+
+}
+
+```
+
+```java
+import me.chanjar.weixin.common.error.WxErrorException;
+import me.chanjar.weixin.common.session.WxSessionManager;
+import me.chanjar.weixin.mp.api.WxMpService;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlMessage;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlOutMessage;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+@Component
+public class ScanHandler extends AbstractHandler {
+
+
+    @Override
+    public WxMpXmlOutMessage handle(WxMpXmlMessage wxMpXmlMessage, Map<String, Object> map,
+                                    WxMpService wxMpService, WxSessionManager wxSessionManager) throws WxErrorException {
+        return null;
+
+    }
+
+}
+```
+
+```java
+import java.util.Map;
+
+/**
+ */
+@Component
+public class SubscribeHandler extends AbstractHandler {
+
+
+    @Override
+    public WxMpXmlOutMessage handle(WxMpXmlMessage wxMessage,
+                                    Map<String, Object> context, WxMpService weixinService,
+                                    WxSessionManager sessionManager) throws WxErrorException {
+
+        this.logger.info("新关注用户 OPENID: " + wxMessage.getFromUser());
+
+        WxMpXmlOutMessage responseResult = null;
+        try {
+            // responseResult = this.handleSpecial(weixinService, wxMessage);
+        } catch (Exception e) {
+            this.logger.error(e.getMessage(), e);
+        }
+
+        if (responseResult != null) {
+            return responseResult;
+        }
+
+
+        return null;
+    }
+
+
+}
+```
+
+
+
+### 配置属性
+
+`application.yml`
+
+```yml
+wx:
+  mp:
+    callback: ${luochat.wx.callback}
+    configs:
+      - appId: ${luochat.wx.appId} # 第一个公众号的appid
+        secret: ${luochat.wx.secret} # 公众号的appsecret
+        token: ${luochat.wx.token} # 接口配置里的Token值
+        aesKey: ${luochat.wx.aesKey} # 接口配置里的EncodingAESKey值
+```
+
+`application-test.properties`
+
+```properties
+##################微信公众号信息(记得替换)##################
+##内网穿透域名
+luochat.wx.callback=http://431c2e53.r11.cpolar.top
+luochat.wx.appId=wxafe32aa5a1c21782
+luochat.wx.secret=450c57e0aed2879a98c03eb64df6d504
+# 接口配置里的Token值
+luochat.wx.token=dfasf627
+```
+
+
+
+### 编写controller接口
+
+```java
+import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import me.chanjar.weixin.mp.api.WxMpMessageRouter;
+import me.chanjar.weixin.mp.api.WxMpService;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlMessage;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlOutMessage;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.view.RedirectView;
+
+/**
+ * Description: 微信api交互接口
+ *
+ * @author <a href="https://github.com/1ranxu">luoying</a>
+ * @since 2024-01-02
+ */
+@Slf4j
+@AllArgsConstructor
+@RestController
+@RequestMapping("wx/portal/public")
+public class WxPortalController {
+
+    private final WxMpService wxService;
+    private final WxMpMessageRouter messageRouter;
+
+
+    @GetMapping(produces = "text/plain;charset=utf-8")
+    public String authGet(@RequestParam(name = "signature", required = false) String signature,
+                          @RequestParam(name = "timestamp", required = false) String timestamp,
+                          @RequestParam(name = "nonce", required = false) String nonce,
+                          @RequestParam(name = "echostr", required = false) String echostr) {
+
+        log.info("\n接收到来自微信服务器的认证消息：[{}, {}, {}, {}]", signature,
+                timestamp, nonce, echostr);
+        if (StringUtils.isAnyBlank(signature, timestamp, nonce, echostr)) {
+            throw new IllegalArgumentException("请求参数非法，请核实!");
+        }
+
+
+        if (wxService.checkSignature(timestamp, nonce, signature)) {
+            return echostr;
+        }
+
+        return "非法请求";
+    }
+
+    @GetMapping("/callBack")
+    public RedirectView callBack(@RequestParam String code) {
+
+        return null;
+    }
+
+    @PostMapping(produces = "application/xml; charset=UTF-8")
+    public String post(@RequestBody String requestBody,
+                       @RequestParam("signature") String signature,
+                       @RequestParam("timestamp") String timestamp,
+                       @RequestParam("nonce") String nonce,
+                       @RequestParam("openid") String openid,
+                       @RequestParam(name = "encrypt_type", required = false) String encType,
+                       @RequestParam(name = "msg_signature", required = false) String msgSignature) {
+        log.info("\n接收微信请求：[openid=[{}], [signature=[{}], encType=[{}], msgSignature=[{}],"
+                        + " timestamp=[{}], nonce=[{}], requestBody=[\n{}\n] ",
+                openid, signature, encType, msgSignature, timestamp, nonce, requestBody);
+
+        if (!wxService.checkSignature(timestamp, nonce, signature)) {
+            throw new IllegalArgumentException("非法请求，可能属于伪造的请求！");
+        }
+
+        String out = null;
+        if (encType == null) {
+            // 明文传输的消息
+            WxMpXmlMessage inMessage = WxMpXmlMessage.fromXml(requestBody);
+            WxMpXmlOutMessage outMessage = this.route(inMessage);
+            if (outMessage == null) {
+                return "";
+            }
+
+            out = outMessage.toXml();
+        } else if ("aes".equalsIgnoreCase(encType)) {
+            // aes加密的消息
+            WxMpXmlMessage inMessage = WxMpXmlMessage.fromEncryptedXml(requestBody, wxService.getWxMpConfigStorage(),
+                    timestamp, nonce, msgSignature);
+            log.debug("\n消息解密后内容为：\n{} ", inMessage.toString());
+            WxMpXmlOutMessage outMessage = this.route(inMessage);
+            if (outMessage == null) {
+                return "";
+            }
+
+            out = outMessage.toEncryptedXml(wxService.getWxMpConfigStorage());
+        }
+
+        log.debug("\n组装回复信息：{}", out);
+        return out;
+    }
+
+    private WxMpXmlOutMessage route(WxMpXmlMessage message) {
+        try {
+            return this.messageRouter.route(message);
+        } catch (Exception e) {
+            log.error("路由消息时出现异常！", e);
+        }
+
+        return null;
+    }
+}
+```
+
+启动项目后，重新绑定一下公众号的域名和token
+
+![image-20240102162649185](assets/image-20240102162649185.png)
+
+![image-20240102162727896](assets/image-20240102162727896.png)
+
+
+
+## 带参二维码接口
+
+![image-20240102181707111](assets/image-20240102181707111.png)
+
+![image-20240102182414714](assets/image-20240102182414714.png)
+
+![image-20240102183220989](assets/image-20240102183220989.png)
+
+![image-20240102182650770](assets/image-20240102182650770.png)
+
+![image-20240102201329107](assets/image-20240102201329107.png)
+
+![image-20240102183853335](assets/image-20240102183853335.png)
+
+![image-20240102183059625](assets/image-20240102183059625.png)
+
+![image-20240102183742819](assets/image-20240102183742819.png)
+
+![image-20240102183941530](assets/image-20240102183941530.png)
+
+
+
+## 用户信息授权接口
+
+[用户授权](https://developers.weixin.qq.com/doc/offiaccount/OA_Web_Apps/Wechat_webpage_authorization.html)
+
+### 用户同意授权，获取code
+
+![image-20240102211409370](assets/image-20240102211409370.png)
+
+![image-20240102210111623](assets/image-20240102210111623.png)
+
+![image-20240102211531440](assets/image-20240102211531440.png)
+
+```java
+import com.luoying.luochat.common.user.service.adapter.TextBuilder;
+import me.chanjar.weixin.common.error.WxErrorException;
+import me.chanjar.weixin.common.session.WxSessionManager;
+import me.chanjar.weixin.mp.api.WxMpService;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlMessage;
+import me.chanjar.weixin.mp.bean.message.WxMpXmlOutMessage;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.net.URLEncoder;
+import java.util.Map;
+
+@Component
+public class ScanHandler extends AbstractHandler {
+
+    @Value("${wx.mp.callback}")
+    private String callback;
+
+    private static final String URL = "https://open.weixin.qq.com/connect/oauth2/authorize?appid=%s&redirect_uri=%s&response_type=code&scope=snsapi_userinfo&state=STATE#wechat_redirect";
+
+    @Override
+    public WxMpXmlOutMessage handle(WxMpXmlMessage wxMpXmlMessage, Map<String, Object> map,
+                                    WxMpService wxMpService, WxSessionManager wxSessionManager) throws WxErrorException {
+        String code = wxMpXmlMessage.getEventKey();
+        String openId = wxMpXmlMessage.getFromUser();
+        // todo 扫码
+        String authorizeUrl = String.format(URL,
+                wxMpService.getWxMpConfigStorage().getAppId(),
+                URLEncoder.encode(callback + "/wx/portal/public/callBack"));
+        return TextBuilder.build("请点击链接登录：<a href=\"" + authorizeUrl + "\">登录</a>", wxMpXmlMessage);
+    }
+
+}
+```
+
+![image-20240102210519815](assets/image-20240102210519815.png)
+
+![image-20240102211141419](assets/image-20240102211141419.png)
+
+### 通过code换取网页授权access_token
+
+![image-20240102210835629](assets/image-20240102210835629.png)
+
+```java
+@GetMapping("/callBack")
+public RedirectView callBack(@RequestParam String code) throws WxErrorException {
+    WxOAuth2AccessToken accessToken = wxMpService.getOAuth2Service().getAccessToken(code);
+    WxOAuth2UserInfo userInfo = wxMpService.getOAuth2Service().getUserInfo(accessToken, "zh_CN");
+    System.out.println(userInfo);
+    return null;
+}
+```
+
+
+
+
+
+## 微信扫码登录实现
+
+我们的项目就是采用的扫公众号事件码的方式登录。
+
+具体的时序图如下
+
+![image-20240103141306768](assets/image-20240103141306768.png)
+
+整体流程介绍的比较详细，用户初次注册才需要授权信息。第二次登录只需要到第9步，就登录完成了。
+
+### 建立websocket连接
+
+进入到这个页面的时候，前端就开始和后端建立了websocket，这时候就已经可以接受新消息推送啦。不过目前这个连接是一个未登录的用户。需要进行登录认证。
+
+![image-20240104100647703](assets/image-20240104100647703.png)
+
+前端通过`new WebSocket("URL")`和后端建立连接。
+
+后端通过在netty中添加处理器，记录并管理连接
+
+![image-20240103150752805](assets/image-20240103150752805.png)
+
+将连接放入一个map中管理，目前该连接是未登录态。
+
+![image-20240103150838554](assets/image-20240103150838554.png)
+
+![image-20240103150936801](assets/image-20240103150936801.png)
+
+![image-20240103142005058](assets/image-20240103142005058.png)
+
+
+
+### 前端请求登录二维码
+
+前端点击登录，会发出一个请求登录二维码的websocket信息。后端做了三件事
+
+1. 生成一个不重复的`登录码`。并且将登录码和这个Channel关联起来。
+2. 然后请求微信的接口，将这个`登录码`转成一个带参数的二维码链接
+3. 返回给前端，前端就将这个二维码链接转成二维码图片展示
+
+![image-20240103142508409](assets/image-20240103142508409.png)
+
+这个事件码就是之后用户登录携带的参数，只有它能和这个`channel`连接关联起来，很重要。
+
+**引入依赖**
+
+`luochat-chat-server的pom`
+
+```xml
+<dependency>
+    <groupId>com.github.ben-manes.caffeine</groupId>
+    <artifactId>caffeine</artifactId>
+</dependency>
+```
+
+![image-20240103161528157](assets/image-20240103161528157.png)
+
+![image-20240103162018509](assets/image-20240103162018509.png)
+
+![image-20240103164309102](assets/image-20240103164309102.png)
+
+![image-20240103162554446](assets/image-20240103162554446.png)
+
+![image-20240103170004562](assets/image-20240103170004562.png)
+
+![image-20240103170021306](assets/image-20240103170021306.png)
+
+![image-20240103170206763](assets/image-20240103170206763.png)
+
+![image-20240103162722576](assets/image-20240103162722576.png)
+
+### 用户扫码
+
+当用户扫码后关注公众号，公众号会给我们后台回调一个关注事件 
+
+当用户扫码且已经关注公众号， 公众号会给我们后台回调一个扫码事件。
+
+都会携带二维码参数 即**登录码**
+
+![image-20240103182756366](assets/image-20240103182756366.png)
+
+![image-20240103182936303](assets/image-20240103182936303.png)
+
+![image-20240103183533215](assets/image-20240103183533215.png)
+
+![image-20240103184006726](assets/image-20240103184006726.png)
+
+![image-20240103184111166](assets/image-20240103184111166.png)
+
+![image-20240103184206334](assets/image-20240103184206334.png)
+
+![image-20240103184253071](assets/image-20240103184253071.png)
+
+### 用户注册
+
+用户扫码后的回调，我们能够获得用户的openid和登录码code，这还不够，对于新用户我们需要他的头像和昵称。
+
+这个信息需要额外的用户授权。于是我们先让用户注册了，再额外给用户发一个推送，请求用户授权。
+
+同时用户注册后，会先临时保存一个openid和登录码的关系映射，以便在用户授权后，通过openId找到code，再通过code找到channel，最后使用channel给前端发送登录成功的用户信息
+
+![image-20240103143012706](assets/image-20240103143012706.png)
+
+
+
+### 授权用户信息
+
+我们推送的授权信息是一个微信授权地址，用户点击后，微信就会回调我们的系统，并且获取一个重定向的地址给用户展示。
+
+```java
+private static final String URL = "https://open.weixin.qq.com/connect/oauth2/authorize?appid=%s&redirect_uri=%s&response_type=code&scope=snsapi_userinfo&state=STATE#wechat_redirect";
+```
+
+![image-20240102211141419](assets/image-20240102211141419.png)
+
+用户看到这样一条信息，点击登录，微信就会给我们发送授权成功的回调。
+
+通过这个userInfo我们就能拿到昵称，openid等。通过openid关联出之前的登录码code，再通过code找到channel，最后使用channel给前端发送登录成功的用户信息
+
+执行回调中的authorize方法
+
+![image-20240103215152735](assets/image-20240103215152735.png)
+
+![image-20240103215358674](assets/image-20240103215358674.png)
+
+![image-20240103220147434](assets/image-20240103220147434.png)
+
+![image-20240103215637881](assets/image-20240103215637881.png)
+
+![image-20240103220737828](assets/image-20240103220737828.png)
+
+![image-20240103220809455](assets/image-20240103220809455.png)
+
+![image-20240103220947835](assets/image-20240103220947835.png)
+
+![image-20240103221954384](assets/image-20240103221954384.png)
+
+RedisKey用于构建我们使用redis时所需要的key
+
+```java
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/4 14:54
+ */
+public class RedisKey {
+    private static final String BASE_KEY = "luochat:chat:";
+
+    /**
+     * 用户token的key
+     */
+    public static final String USER_TOKEN_STRING = "userToken:uid_%d";
+
+    public static String getKey(String key, Object... o) {
+        return BASE_KEY + String.format(key, o);
+    }
+}
+```
+
+![image-20240104161020256](assets/image-20240104161020256.png)
+
+**LoginServiceImpl 1.0**
+
+```java
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/3 20:46
+ */
+@Service
+public class LoginServiceImpl implements LoginService {
+    public static final int TOKEN_EXPIRE_DAYS = 3;
+    public static final int TOKEN_RENEWAL_DAYS = 1;
+    @Resource
+    private JwtUtils jwtUtils;
+
+    @Override
+    public void renewalTokenIfNecessary(String token) {
+        Long uid = getValidUid(token);
+        String userTokenKey = getUserTokenKey(uid);
+        Long expireDays = RedisUtils.getExpire(userTokenKey, TimeUnit.DAYS);
+        if (expireDays == -2) { // 不存在的key
+            return;
+        }
+        if (expireDays < TOKEN_RENEWAL_DAYS) {
+            RedisUtils.expire(getUserTokenKey(uid), TOKEN_EXPIRE_DAYS, TimeUnit.DAYS);
+        }
+    }
+
+    @Override
+    public String login(Long uid) {
+        String token = jwtUtils.createToken(uid);
+        RedisUtils.set(getUserTokenKey(uid), token, TOKEN_EXPIRE_DAYS, TimeUnit.DAYS);
+        return token;
+    }
+
+    @Override
+    public Long getValidUid(String oldToken) {
+        Long uid = jwtUtils.getUidOrNull(oldToken);
+        if (Objects.isNull(uid)) {
+            return null;
+        }
+        String tokenInRedis = RedisUtils.get(getUserTokenKey(uid));
+        if (StrUtil.isBlank(tokenInRedis)) {
+            return null;
+        }
+        // oldToken必须与tokenInRedis相同，才能返回uid，如果不做判断直接返回，会导致即使两者不相同也能返回uid
+        // 这种情况是不允许发生的，不相同说明用户的oldToken已经过期了且用户又重新登录了一次，此时用户竟然拿着过期的
+        // token来测试我们系统的严谨性，当然得让他看看我们的技术了
+        return Objects.equals(tokenInRedis, oldToken) ? uid : null;
+    }
+
+    private String getUserTokenKey(Long uid) {
+        return RedisKey.getKey(RedisKey.USER_TOKEN_STRING, uid);
+    }
+}
+```
+
+这时候会生成用户的token。然后将连接标识为登录连接.就变成了
+
+![image-20240103143810215](assets/image-20240103143810215.png)
+
+为什么还需要一个在线用户管理呢？
+
+因为用户可能在多端登录，一个uid就可能会多个连接。思考两个场景：用户所有连接都下线，才能算用户下线；私聊推送用户的时候，需要推送某个uid的所有连接。都需要额外有个uid作为key的关系映射map。
+
+假设用户在手机端也登录了。就是这样的效果
+
+![image-20240103144338688](assets/image-20240103144338688.png)
+
+
+
+### 后端主动推送
+
+后端推送就很简单了，目前都是针对所有连接推送。所以我们应该选取在线连接管理里的所有连接。
+
+![image-20240103145232783](assets/image-20240103145232783.png)
+
+## 整合JWT
+
+### 引入依赖
+
+`luochat-chat-server的pom`
+
+```xml
+<dependency>
+    <groupId>com.auth0</groupId>
+    <artifactId>java-jwt</artifactId>xml
+    <version>3.19.0</version>
+</dependency>
+```
+
+### 引入工具类
+
+```java
+import com.auth0.jwt.JWT;
+import com.auth0.jwt.algorithms.Algorithm;
+import com.auth0.jwt.interfaces.Claim;
+import com.auth0.jwt.interfaces.DecodedJWT;
+import com.auth0.jwt.interfaces.JWTVerifier;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.util.Date;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * Description: jwt的token生成与解析
+ * @Author 落樱的悔恨
+ * @Date 2024/1/4 12:57
+ */
+@Slf4j
+@Component
+public class JwtUtils {
+
+    /**
+     * token秘钥，请勿泄露，请勿随便修改
+     */
+    @Value("${luochat.jwt.secret}")
+    private String secret;
+
+    private static final String UID_CLAIM = "uid";
+    private static final String CREATE_TIME = "createTime";
+
+    /**
+     * JWT生成Token.<br/>
+     * <p>
+     * JWT构成: header, payload, signature
+     */
+    public String createToken(Long uid) {
+        // build token
+        String token = JWT.create()
+                .withClaim(UID_CLAIM, uid) // 只存一个uid信息，其他的自己去redis查
+                .withClaim(CREATE_TIME, new Date())
+                .sign(Algorithm.HMAC256(secret)); // signature
+        return token;
+    }
+
+    public static void main(String[] args) {
+        JwtUtils jwtUtils = new JwtUtils();
+        String token = jwtUtils.createToken(123L);
+        System.out.println(token);
+    }
+
+    /**
+     * 解密Token
+     *
+     * @param token
+     * @return
+     */
+    public Map<String, Claim> verifyToken(String token) {
+        if (StringUtils.isEmpty(token)) {
+            return null;
+        }
+        try {
+            JWTVerifier verifier = JWT.require(Algorithm.HMAC256(secret)).build();
+            DecodedJWT jwt = verifier.verify(token);
+            return jwt.getClaims();
+        } catch (Exception e) {
+            log.error("decode error,token:{}", token, e);
+        }
+        return null;
+    }
+
+
+    /**
+     * 根据Token获取uid
+     *
+     * @param token
+     * @return uid
+     */
+    public Long getUidOrNull(String token) {
+        return Optional.ofNullable(verifyToken(token))
+                .map(map -> map.get(UID_CLAIM))
+                .map(Claim::asLong)
+                .orElse(null);
+    }
+
+}
+```
+
+![image-20240104134929568](assets/image-20240104134929568.png)
+
+### 修改application.yml
+
+```yml
+jwt:
+  secret: ${luochat.jwt.secret}
+```
+
+### 修改application-test.properties
+
+```properties
+##################jwt##################
+luochat.jwt.secret=12srtgdf213
+```
+
+
+
+## 整合Redis
+
+### 引入依赖
+
+`luochat-common-starter的pom`
+
+```
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+### 配置文件
+
+`application.yml`
+
+```yml
+spring:
+  redis:
+    # Redis服务器地址
+    host: ${luochat.redis.host}
+    # Redis服务器端口号
+    port: ${luochat.redis.port}
+    # 使用的数据库索引，默认是0
+    database: 0
+    # 连接超时时间yml
+    timeout: 1800000
+    # 设置密码
+    password: ${luochat.redis.password}
+```
+
+### 代码实践
+
+```java
+@Resource
+private RedisTemplate redisTemplate;
+@Test
+public void testRedis() throws InterruptedException {
+    redisTemplate.opsForValue().set("name","卷心菜");
+    String name = (String) redisTemplate.opsForValue().get("name");
+    System.out.println(name); //卷心菜
+}
+```
+
+问题出现了：当我们使用Redis客户端查看刚刚存入[Redis数据库](https://so.csdn.net/so/search?q=Redis数据库&spm=1001.2101.3001.7020)的数据时，结果是这样的：
+
+![image-20240104135358355](assets/image-20240104135358355.png)
+
+是因为在使用默认的对象redisTemplate时，会把value值序列化为byte类型，所以就出现了上图的结果。
+
+### 自定义序列化器
+
+```java
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory redisConnectionFactory)
+            throws UnknownHostException {
+        // 创建模板
+        RedisTemplate<String, Object> redisTemplate = new RedisTemplate<>();
+        // 设置连接工厂
+        redisTemplate.setConnectionFactory(redisConnectionFactory);
+        // 设置序列化工具
+        GenericJackson2JsonRedisSerializer jsonRedisSerializer =
+                new GenericJackson2JsonRedisSerializer();
+        // key和 hashKey采用 string序列化
+        redisTemplate.setKeySerializer(RedisSerializer.string());
+        redisTemplate.setHashKeySerializer(RedisSerializer.string());
+        // value和 hashValue采用 JSON序列化
+        redisTemplate.setValueSerializer(jsonRedisSerializer);
+        redisTemplate.setHashValueSerializer(jsonRedisSerializer);
+        return redisTemplate;
+    }
+}
+```
+
+当配置好配置类后，再次执行上文的代码就不会出现上述情况了，但是问题又来了，当我们的value是一个对象时，会把类名也存进去，造成空间浪费：
+
+![image-20240104135853797](assets/image-20240104135853797.png)
+
+不仅仅是这个问题，由于我们的value是object类型。在反序列化的时候还经常会出现把long值转成int值导致泛型转化失败等场景。
+
+这里不推荐**json序列化器**，直接用**string序列化器**
+
+**用**spring的 **stringRedisTemplate，**要求只能存储String类型的key和value。
+
+这样每次存取很麻烦，但是可以通过redisUtils工具类来屏蔽这层麻烦。
+
+
+
+### RedisUtil使用
+
+```java
+import cn.hutool.extra.spring.SpringUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.RedisConnectionUtils;
+import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations.TypedTuple;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
+
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+@Slf4j
+public class RedisUtils {
+
+    private static StringRedisTemplate stringRedisTemplate;
+
+    static {
+        RedisUtils.stringRedisTemplate = SpringUtil.getBean(StringRedisTemplate.class);
+    }
+
+    private static final String LUA_INCR_EXPIRE =
+            "local key,ttl=KEYS[1],ARGV[1] \n" +
+                    " \n" +
+                    "if redis.call('EXISTS',key)==0 then   \n" +
+                    "  redis.call('SETEX',key,ttl,1) \n" +
+                    "  return 1 \n" +
+                    "else \n" +
+                    "  return tonumber(redis.call('INCR',key)) \n" +
+                    "end ";
+
+    public static Long inc(String key, int time, TimeUnit unit) {
+        RedisScript<Long> redisScript = new DefaultRedisScript<>(LUA_INCR_EXPIRE, Long.class);
+        return stringRedisTemplate.execute(redisScript, Collections.singletonList(key), String.valueOf(unit.toSeconds(time)));
+    }
+
+    /**
+     * 自增int
+     *
+     * @param key  键
+     * @param time 时间(秒)
+     */
+    public static Integer integerInc(String key, int time, TimeUnit unit) {
+        RedisScript<Long> redisScript = new DefaultRedisScript<>(LUA_INCR_EXPIRE, Long.class);
+        Long result = stringRedisTemplate.execute(redisScript, Collections.singletonList(key), String.valueOf(unit.toSeconds(time)));
+        try {
+            return Integer.parseInt(result.toString());
+        } catch (Exception e) {
+            RedisUtils.del(key);
+            throw e;
+        }
+    }
+
+    /**
+     * 指定缓存失效时间
+     *
+     * @param key  键
+     * @param time 时间(秒)
+     */
+    public static Boolean expire(String key, long time) {
+        try {
+            if (time > 0) {
+                stringRedisTemplate.expire(key, time, TimeUnit.SECONDS);
+            }
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 指定缓存失效时间
+     *
+     * @param key      键
+     * @param time     时间(秒)
+     * @param timeUnit 单位
+     */
+    public static Boolean expire(String key, long time, TimeUnit timeUnit) {
+        try {
+            if (time > 0) {
+                stringRedisTemplate.expire(key, time, timeUnit);
+            }
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 根据 key 获取过期时间
+     *
+     * @param key 键 不能为null
+     * @return 时间(秒) 返回0代表为永久有效
+     */
+    public static Long getExpire(String key) {
+        return stringRedisTemplate.getExpire(key, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 根据 key 获取过期时间
+     *
+     * @param key 键 不能为null
+     * @return 时间(秒) 返回0代表为永久有效
+     */
+    public static Long getExpire(String key, TimeUnit timeUnit) {
+        return stringRedisTemplate.getExpire(key, timeUnit);
+    }
+
+    /**
+     * 查找匹配key
+     *
+     * @param pattern key
+     * @return /
+     */
+    public static List<String> scan(String pattern) {
+        ScanOptions options = ScanOptions.scanOptions().match(pattern).build();
+        RedisConnectionFactory factory = stringRedisTemplate.getConnectionFactory();
+        RedisConnection rc = Objects.requireNonNull(factory).getConnection();
+        Cursor<byte[]> cursor = rc.scan(options);
+        List<String> result = new ArrayList<>();
+        while (cursor.hasNext()) {
+            result.add(new String(cursor.next()));
+        }
+        try {
+            RedisConnectionUtils.releaseConnection(rc, factory);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+        }
+        return result;
+    }
+
+    /**
+     * 分页查询 key
+     *
+     * @param patternKey key
+     * @param page       页码
+     * @param size       每页数目
+     * @return /
+     */
+    public static List<String> findKeysForPage(String patternKey, int page, int size) {
+        ScanOptions options = ScanOptions.scanOptions().match(patternKey).build();
+        RedisConnectionFactory factory = stringRedisTemplate.getConnectionFactory();
+        RedisConnection rc = Objects.requireNonNull(factory).getConnection();
+        Cursor<byte[]> cursor = rc.scan(options);
+        List<String> result = new ArrayList<>(size);
+        int tmpIndex = 0;
+        int fromIndex = page * size;
+        int toIndex = page * size + size;
+        while (cursor.hasNext()) {
+            if (tmpIndex >= fromIndex && tmpIndex < toIndex) {
+                result.add(new String(cursor.next()));
+                tmpIndex++;
+                continue;
+            }
+            // 获取到满足条件的数据后,就可以退出了
+            if (tmpIndex >= toIndex) {
+                break;
+            }
+            tmpIndex++;
+            cursor.next();
+        }
+        try {
+            RedisConnectionUtils.releaseConnection(rc, factory);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+        }
+        return result;
+    }
+
+    /**
+     * 判断key是否存在
+     *
+     * @param key 键
+     * @return true 存在 false不存在
+     */
+    public static Boolean hasKey(String key) {
+        try {
+            return stringRedisTemplate.hasKey(key);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+
+    /**
+     * 删除缓存
+     *
+     * @param keys
+     */
+    public static void del(String... keys) {
+        if (keys != null && keys.length > 0) {
+            if (keys.length == 1) {
+                Boolean result = stringRedisTemplate.delete(keys[0]);
+                log.debug("--------------------------------------------");
+                log.debug("删除缓存：" + keys[0] + "，结果：" + result);
+            } else {
+                Set<String> keySet = new HashSet<>();
+                for (String key : keys) {
+                    Set<String> stringSet = stringRedisTemplate.keys(key);
+                    if (Objects.nonNull(stringSet) && !stringSet.isEmpty()) {
+                        keySet.addAll(stringSet);
+                    }
+                }
+                Long count = stringRedisTemplate.delete(keySet);
+                log.debug("--------------------------------------------");
+                log.debug("成功删除缓存：" + keySet);
+                log.debug("缓存删除数量：" + count + "个");
+            }
+            log.debug("--------------------------------------------");
+        }
+    }
+
+    public static void del(List<String> keys) {
+        stringRedisTemplate.delete(keys);
+    }
+
+    // ============================String=============================
+
+    /**
+     * 普通缓存获取
+     *
+     * @param key 键
+     * @return 值
+     */
+    public static String get(String key) {
+        return key == null ? null : stringRedisTemplate.opsForValue().get(key);
+    }
+
+    /**
+     * 普通缓存放入
+     *
+     * @param key   键
+     * @param value 值
+     * @return true成功 false失败
+     */
+    public static Boolean set(String key, Object value) {
+        try {
+            stringRedisTemplate.opsForValue().set(key, objToStr(value));
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    public static String getStr(String key) {
+        return get(key, String.class);
+    }
+
+    public static <T> T get(String key, Class<T> tClass) {
+        String s = get(key);
+        return toBeanOrNull(s, tClass);
+    }
+
+    public static <T> List<T> mget(Collection<String> keys, Class<T> tClass) {
+        List<String> list = stringRedisTemplate.opsForValue().multiGet(keys);
+        if (Objects.isNull(list)) {
+            return new ArrayList<>();
+        }
+        return list.stream().map(o -> toBeanOrNull(o, tClass)).collect(Collectors.toList());
+    }
+
+    static <T> T toBeanOrNull(String json, Class<T> tClass) {
+        return json == null ? null : JsonUtils.toObj(json, tClass);
+    }
+
+    public static String objToStr(Object o) {
+        return JsonUtils.toStr(o);
+    }
+
+    public static <T> void mset(Map<String, T> map, long time) {
+        Map<String, String> collect = map.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, (e) -> objToStr(e.getValue())));
+        stringRedisTemplate.opsForValue().multiSet(collect);
+        map.forEach((key, value) -> {
+            expire(key, time);
+        });
+    }
+
+
+    /**
+     * 普通缓存放入并设置时间
+     *
+     * @param key   键
+     * @param value 值
+     * @param time  时间(秒) time要大于0 如果time小于等于0 将设置无限期
+     * @return true成功 false 失败
+     */
+    public static Boolean set(String key, Object value, long time) {
+        try {
+            if (time > 0) {
+                stringRedisTemplate.opsForValue().set(key, objToStr(value), time, TimeUnit.SECONDS);
+            } else {
+                set(key, value);
+            }
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 普通缓存放入并设置时间
+     *
+     * @param key      键
+     * @param value    值
+     * @param time     时间
+     * @param timeUnit 类型
+     * @return true成功 false 失败
+     */
+    public static Boolean set(String key, Object value, long time, TimeUnit timeUnit) {
+        try {
+            if (time > 0) {
+                stringRedisTemplate.opsForValue().set(key, objToStr(value), time, timeUnit);
+            } else {
+                set(key, value);
+            }
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    // ================================Map=================================
+
+    /**
+     * HashGet
+     *
+     * @param key  键 不能为null
+     * @param item 项 不能为null
+     * @return 值
+     */
+    public static Object hget(String key, String item) {
+        return stringRedisTemplate.opsForHash().get(key, item);
+    }
+
+    /**
+     * 获取hashKey对应的所有键值
+     *
+     * @param key 键
+     * @return 对应的多个键值
+     */
+    public static Map<Object, Object> hmget(String key) {
+        return stringRedisTemplate.opsForHash().entries(key);
+
+    }
+
+    /**
+     * HashSet
+     *
+     * @param key 键
+     * @param map 对应多个键值
+     * @return true 成功 false 失败
+     */
+    public static Boolean hmset(String key, Map<String, Object> map) {
+        try {
+            stringRedisTemplate.opsForHash().putAll(key, map);
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * HashSet 并设置时间
+     *
+     * @param key  键
+     * @param map  对应多个键值
+     * @param time 时间(秒)
+     * @return true成功 false失败
+     */
+    public static Boolean hmset(String key, Map<String, Object> map, long time) {
+        try {
+            stringRedisTemplate.opsForHash().putAll(key, map);
+            if (time > 0) {
+                expire(key, time);
+            }
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 向一张hash表中放入数据,如果不存在将创建
+     *
+     * @param key   键
+     * @param item  项
+     * @param value 值
+     * @return true 成功 false失败
+     */
+    public static Boolean hset(String key, String item, Object value) {
+        try {
+            stringRedisTemplate.opsForHash().put(key, item, value);
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 向一张hash表中放入数据,如果不存在将创建
+     *
+     * @param key   键
+     * @param item  项
+     * @param value 值
+     * @param time  时间(秒) 注意:如果已存在的hash表有时间,这里将会替换原有的时间
+     * @return true 成功 false失败
+     */
+    public static Boolean hset(String key, String item, Object value, long time) {
+        try {
+            stringRedisTemplate.opsForHash().put(key, item, value);
+            if (time > 0) {
+                expire(key, time);
+            }
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 删除hash表中的值
+     *
+     * @param key  键 不能为null
+     * @param item 项 可以使多个 不能为null
+     */
+    public static void hdel(String key, Object... item) {
+        stringRedisTemplate.opsForHash().delete(key, item);
+    }
+
+    /**
+     * 判断hash表中是否有该项的值
+     *
+     * @param key  键 不能为null
+     * @param item 项 不能为null
+     * @return true 存在 false不存在
+     */
+    public static Boolean hHasKey(String key, String item) {
+        return stringRedisTemplate.opsForHash().hasKey(key, item);
+    }
+
+    /**
+     * hash递增 如果不存在,就会创建一个 并把新增后的值返回
+     *
+     * @param key  键
+     * @param item 项
+     * @param by   要增加几(大于0)
+     * @return
+     */
+    public static Double hincr(String key, String item, double by) {
+        return stringRedisTemplate.opsForHash().increment(key, item, by);
+    }
+
+    /**
+     * hash递减
+     *
+     * @param key  键
+     * @param item 项
+     * @param by   要减少记(小于0)
+     * @return
+     */
+    public static Double hdecr(String key, String item, double by) {
+        return stringRedisTemplate.opsForHash().increment(key, item, -by);
+    }
+
+    // ============================set=============================
+
+    /**
+     * 根据key获取Set中的所有值
+     *
+     * @param key 键
+     * @return
+     */
+    public static Set<String> sGet(String key) {
+        try {
+            return stringRedisTemplate.opsForSet().members(key);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
+     * 根据value从一个set中查询,是否存在
+     *
+     * @param key   键
+     * @param value 值
+     * @return true 存在 false不存在
+     */
+    public static Boolean sHasKey(String key, Object value) {
+        try {
+            return stringRedisTemplate.opsForSet().isMember(key, value);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 将数据放入set缓存
+     *
+     * @param key    键
+     * @param values 值 可以是多个
+     * @return 成功个数
+     */
+    public static Long sSet(String key, Object... values) {
+        try {
+            String[] s = new String[values.length];
+            for (int i = 0; i < values.length; i++) {
+                s[i] = objToStr(values[i]);
+            }
+            return stringRedisTemplate.opsForSet().add(key, s);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return 0L;
+        }
+    }
+
+    /**
+     * 将set数据放入缓存
+     *
+     * @param key    键
+     * @param time   时间(秒)
+     * @param values 值 可以是多个
+     * @return 成功个数
+     */
+    public static Long sSetAndTime(String key, long time, Object... values) {
+        try {
+            String[] s = new String[values.length];
+            for (int i = 0; i < values.length; i++) {
+                s[i] = objToStr(values[i]);
+            }
+            Long count = stringRedisTemplate.opsForSet().add(key, s);
+            if (time > 0) {
+                expire(key, time);
+            }
+            return count;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return 0L;
+        }
+    }
+
+    /**
+     * 获取set缓存的长度
+     *
+     * @param key 键
+     * @return
+     */
+    public static Long sGetSetSize(String key) {
+        try {
+            return stringRedisTemplate.opsForSet().size(key);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return 0L;
+        }
+    }
+
+    /**
+     * 移除值为value的
+     *
+     * @param key    键
+     * @param values 值 可以是多个
+     * @return 移除的个数
+     */
+    public static Long setRemove(String key, Object... values) {
+        try {
+            return stringRedisTemplate.opsForSet().remove(key, values);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return 0L;
+        }
+    }
+
+    // ===============================list=================================
+
+    /**
+     * 获取list缓存的内容
+     *
+     * @param key   键
+     * @param start 开始
+     * @param end   结束 0 到 -1代表所有值
+     * @return
+     */
+    public static List<String> lGet(String key, long start, long end) {
+        try {
+            return stringRedisTemplate.opsForList().range(key, start, end);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
+     * 获取list缓存的长度
+     *
+     * @param key 键
+     * @return
+     */
+    public static Long lGetListSize(String key) {
+        try {
+            return stringRedisTemplate.opsForList().size(key);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return 0L;
+        }
+    }
+
+    /**
+     * 通过索引 获取list中的值
+     *
+     * @param key   键
+     * @param index 索引 index>=0时， 0 表头，1 第二个元素，依次类推；index<0时，-1，表尾，-2倒数第二个元素，依次类推
+     * @return
+     */
+    public static String lGetIndex(String key, long index) {
+        try {
+            return stringRedisTemplate.opsForList().index(key, index);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
+     * 将list放入缓存
+     *
+     * @param key   键
+     * @param value 值
+     * @return
+     */
+    public static Boolean lSet(String key, Object value) {
+        try {
+            stringRedisTemplate.opsForList().rightPush(key, objToStr(value));
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 将list放入缓存
+     *
+     * @param key   键
+     * @param value 值
+     * @param time  时间(秒)
+     * @return
+     */
+    public static Boolean lSet(String key, Object value, long time) {
+        try {
+            stringRedisTemplate.opsForList().rightPush(key, objToStr(value));
+            if (time > 0) {
+                expire(key, time);
+            }
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 将list放入缓存
+     *
+     * @param key   键
+     * @param value 值
+     * @return
+     */
+    public static Boolean lSet(String key, List<Object> value) {
+        try {
+            List<String> list = new ArrayList<>();
+            for (Object item : value) {
+                list.add(objToStr(item));
+            }
+            stringRedisTemplate.opsForList().rightPushAll(key, list);
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 将list放入缓存
+     *
+     * @param key   键
+     * @param value 值
+     * @param time  时间(秒)
+     * @return
+     */
+    public static Boolean lSet(String key, List<Object> value, long time) {
+        try {
+            List<String> list = new ArrayList<>();
+            for (Object item : value) {
+                list.add(objToStr(item));
+            }
+            stringRedisTemplate.opsForList().rightPushAll(key, list);
+            if (time > 0) {
+                expire(key, time);
+            }
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 根据索引修改list中的某条数据
+     *
+     * @param key   键
+     * @param index 索引
+     * @param value 值
+     * @return /
+     */
+    public static Boolean lUpdateIndex(String key, long index, Object value) {
+        try {
+            stringRedisTemplate.opsForList().set(key, index, objToStr(value));
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 移除N个值为value
+     *
+     * @param key   键
+     * @param count 移除多少个
+     * @param value 值
+     * @return 移除的个数
+     */
+    public static Long lRemove(String key, long count, Object value) {
+        try {
+            return stringRedisTemplate.opsForList().remove(key, count, value);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            return 0L;
+        }
+    }
+
+    /**
+     * @param prefix 前缀
+     * @param ids    id
+     */
+    public void delByKeys(String prefix, Set<Long> ids) {
+        Set<String> keys = new HashSet<>();
+        for (Long id : ids) {
+            Set<String> stringSet = stringRedisTemplate.keys(prefix + id);
+            if (Objects.nonNull(stringSet) && !stringSet.isEmpty()) {
+                keys.addAll(stringSet);
+            }
+        }
+        Long count = stringRedisTemplate.delete(keys);
+        // 此处提示可自行删除
+        log.debug("--------------------------------------------");
+        log.debug("成功删除缓存：" + keys.toString());
+        log.debug("缓存删除数量：" + count + "个");
+        log.debug("--------------------------------------------");
+    }
+    /**------------------zSet相关操作--------------------------------*/
+
+    /**
+     * 添加元素,有序集合是按照元素的score值由小到大排列
+     *
+     * @param key
+     * @param value
+     * @param score
+     * @return
+     */
+    public static Boolean zAdd(String key, String value, double score) {
+        return stringRedisTemplate.opsForZSet().add(key, value, score);
+    }
+
+    public static Boolean zAdd(String key, Object value, double score) {
+        return zAdd(key, value.toString(), score);
+    }
+
+    public static Boolean zIsMember(String key, Object value) {
+        return Objects.nonNull(stringRedisTemplate.opsForZSet().score(key, value.toString()));
+    }
+
+    /**
+     * @param key
+     * @param values
+     * @return
+     */
+    public Long zAdd(String key, Set<TypedTuple<String>> values) {
+        return stringRedisTemplate.opsForZSet().add(key, values);
+    }
+
+    /**
+     * @param key
+     * @param values
+     * @return
+     */
+    public static Long zRemove(String key, Object... values) {
+        return stringRedisTemplate.opsForZSet().remove(key, values);
+    }
+
+    public static Long zRemove(String key, Object value) {
+        return zRemove(key, value.toString());
+    }
+
+    public static Long zRemove(String key, String value) {
+        return stringRedisTemplate.opsForZSet().remove(key, value);
+    }
+
+    /**
+     * 增加元素的score值，并返回增加后的值
+     *
+     * @param key
+     * @param value
+     * @param delta
+     * @return
+     */
+    public static Double zIncrementScore(String key, String value, double delta) {
+        return stringRedisTemplate.opsForZSet().incrementScore(key, value, delta);
+    }
+
+    /**
+     * 返回元素在集合的排名,有序集合是按照元素的score值由小到大排列
+     *
+     * @param key
+     * @param value
+     * @return 0表示第一位
+     */
+    public static Long zRank(String key, Object value) {
+        return stringRedisTemplate.opsForZSet().rank(key, value);
+    }
+
+    /**
+     * 返回元素在集合的排名,按元素的score值由大到小排列
+     *
+     * @param key
+     * @param value
+     * @return
+     */
+    public static Long zReverseRank(String key, Object value) {
+        return stringRedisTemplate.opsForZSet().reverseRank(key, value);
+    }
+
+    /**
+     * 获取集合的元素, 从小到大排序
+     *
+     * @param key
+     * @param start 开始位置
+     * @param end   结束位置, -1查询所有
+     * @return
+     */
+    public static Set<String> zRange(String key, long start, long end) {
+        return stringRedisTemplate.opsForZSet().range(key, start, end);
+    }
+
+    public static Set<String> zAll(String key) {
+        return stringRedisTemplate.opsForZSet().range(key, 0, -1);
+    }
+
+    /**
+     * 获取集合元素, 并且把score值也获取
+     *
+     * @param key
+     * @param start
+     * @param end
+     * @return
+     */
+    public static Set<TypedTuple<String>> zRangeWithScores(String key, long start,
+                                                           long end) {
+        return stringRedisTemplate.opsForZSet().rangeWithScores(key, start, end);
+    }
+
+    /**
+     * 根据Score值查询集合元素
+     *
+     * @param key
+     * @param min 最小值
+     * @param max 最大值
+     * @return
+     */
+    public static Set<String> zRangeByScore(String key, double min, double max) {
+        return stringRedisTemplate.opsForZSet().rangeByScore(key, min, max);
+    }
+
+    /**
+     * 根据Score值查询集合元素, 从小到大排序
+     *
+     * @param key
+     * @param min 最小值
+     * @param max 最大值
+     * @return
+     */
+    public static Set<TypedTuple<String>> zRangeByScoreWithScores(String key,
+                                                                  Double min, Double max) {
+        if (Objects.isNull(min)) {
+            min = Double.MIN_VALUE;
+        }
+        if (Objects.isNull(max)) {
+            max = Double.MAX_VALUE;
+        }
+        return stringRedisTemplate.opsForZSet().rangeByScoreWithScores(key, min, max);
+    }
+
+    /**
+     * @param key
+     * @param min
+     * @param max
+     * @param start
+     * @param end
+     * @return
+     */
+    public static Set<TypedTuple<String>> zRangeByScoreWithScores(String key,
+                                                                  double min, double max, long start, long end) {
+        return stringRedisTemplate.opsForZSet().rangeByScoreWithScores(key, min, max,
+                start, end);
+    }
+
+    /**
+     * 获取集合的元素, 从大到小排序
+     *
+     * @param key
+     * @param start
+     * @param end
+     * @return
+     */
+    public static Set<String> zReverseRange(String key, long start, long end) {
+        return stringRedisTemplate.opsForZSet().reverseRange(key, start, end);
+    }
+
+//    /**
+//     * 获取集合的元素, 从大到小排序, 并返回score值
+//     *
+//     * @param key
+//     * @param start
+//     * @param end
+//     * @return
+//     */
+//    public Set<TypedTuple<String>> zReverseRangeWithScores(String key,
+//                                                           long start, long end) {
+//        return redisTemplate.opsForZSet().reverseRangeWithScores(key, start,
+//                end);
+//    }
+
+    /**
+     * 获取集合的元素, 从大到小排序, 并返回score值
+     *
+     * @param key
+     * @param pageSize
+     * @return
+     */
+    public static Set<TypedTuple<String>> zReverseRangeWithScores(String key,
+                                                                  long pageSize) {
+        return stringRedisTemplate.opsForZSet().reverseRangeByScoreWithScores(key, Double.MIN_VALUE,
+                Double.MAX_VALUE, 0, pageSize);
+    }
+
+    /**
+     * @param key
+     * @param max
+     * @param pageSize
+     * @return
+     */
+    public static Set<TypedTuple<String>> zReverseRangeByScoreWithScores(String key,
+                                                                         double max, long pageSize) {
+        return stringRedisTemplate.opsForZSet().reverseRangeByScoreWithScores(key, Double.MIN_VALUE, max,
+                1, pageSize);
+    }
+
+//    /**
+//     * 根据Score值查询集合元素, 从大到小排序
+//     *
+//     * @param key
+//     * @param min
+//     * @param max
+//     * @return
+//     */
+//    public Set<String> zReverseRangeByScore(String key, double min,
+//                                            double max) {
+//        return redisTemplate.opsForZSet().reverseRangeByScore(key, min, max);
+//    }
+
+//    /**
+//     * 根据Score值查询集合元素, 从大到小排序
+//     *
+//     * @param key
+//     * @param min
+//     * @param max
+//     * @return
+//     */
+//    public Set<TypedTuple<String>> zReverseRangeByScoreWithScores(
+//            String key, double min, double max) {
+//        return redisTemplate.opsForZSet().reverseRangeByScoreWithScores(key,
+//                min, max);
+//    }
+
+
+    /**
+     * 根据score值获取集合元素数量
+     *
+     * @param key
+     * @param min
+     * @param max
+     * @return
+     */
+    public static Long zCount(String key, double min, double max) {
+        return stringRedisTemplate.opsForZSet().count(key, min, max);
+    }
+
+    /**
+     * 获取集合大小
+     *
+     * @param key
+     * @return
+     */
+    public static Long zSize(String key) {
+        return stringRedisTemplate.opsForZSet().size(key);
+    }
+
+    /**
+     * 获取集合大小
+     *
+     * @param key
+     * @return
+     */
+    public static Long zCard(String key) {
+        return stringRedisTemplate.opsForZSet().zCard(key);
+    }
+
+    /**
+     * 获取集合中value元素的score值
+     *
+     * @param key
+     * @param value
+     * @return
+     */
+    public static Double zScore(String key, Object value) {
+        return stringRedisTemplate.opsForZSet().score(key, value);
+    }
+
+    /**
+     * 移除指定索引位置的成员
+     *
+     * @param key
+     * @param start
+     * @param end
+     * @return
+     */
+    public static Long zRemoveRange(String key, long start, long end) {
+        return stringRedisTemplate.opsForZSet().removeRange(key, start, end);
+    }
+
+    /**
+     * 根据指定的score值的范围来移除成员
+     *
+     * @param key
+     * @param min
+     * @param max
+     * @return
+     */
+    public static Long zRemoveRangeByScore(String key, double min, double max) {
+        return stringRedisTemplate.opsForZSet().removeRangeByScore(key, min, max);
+    }
+
+    /**
+     * 获取key和otherKey的并集并存储在destKey中
+     *
+     * @param key
+     * @param otherKey
+     * @param destKey
+     * @return
+     */
+    public static Long zUnionAndStore(String key, String otherKey, String destKey) {
+        return stringRedisTemplate.opsForZSet().unionAndStore(key, otherKey, destKey);
+    }
+
+    /**
+     * @param key
+     * @param otherKeys
+     * @param destKey
+     * @return
+     */
+    public static Long zUnionAndStore(String key, Collection<String> otherKeys,
+                                      String destKey) {
+        return stringRedisTemplate.opsForZSet()
+                .unionAndStore(key, otherKeys, destKey);
+    }
+
+    /**
+     * 交集
+     *
+     * @param key
+     * @param otherKey
+     * @param destKey
+     * @return
+     */
+    public static Long zIntersectAndStore(String key, String otherKey,
+                                          String destKey) {
+        return stringRedisTemplate.opsForZSet().intersectAndStore(key, otherKey,
+                destKey);
+    }
+
+    /**
+     * 交集
+     *
+     * @param key
+     * @param otherKeys
+     * @param destKey
+     * @return
+     */
+    public static Long zIntersectAndStore(String key, Collection<String> otherKeys,
+                                          String destKey) {
+        return stringRedisTemplate.opsForZSet().intersectAndStore(key, otherKeys,
+                destKey);
+    }
+
+}
+```
+
+```java
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.util.List;
+
+/**
+ * Description:
+ */
+public class JsonUtils {
+    private static final ObjectMapper jsonMapper = new ObjectMapper();
+
+    public static <T> T toObj(String str, Class<T> clz) {
+        try {
+            return jsonMapper.readValue(str, clz);
+        } catch (JsonProcessingException e) {
+            throw new UnsupportedOperationException(e);
+        }
+    }
+
+    public static <T> T toObj(String str, TypeReference<T> clz) {
+        try {
+            return jsonMapper.readValue(str, clz);
+        } catch (JsonProcessingException e) {
+            throw new UnsupportedOperationException(e);
+        }
+    }
+
+    public static <T> List<T> toList(String str, Class<T> clz) {
+        try {
+            return jsonMapper.readValue(str, new TypeReference<List<T>>() {
+            });
+        } catch (JsonProcessingException e) {
+            throw new UnsupportedOperationException(e);
+        }
+    }
+
+    public static JsonNode toJsonNode(String str) {
+        try {
+            return jsonMapper.readTree(str);
+        } catch (JsonProcessingException e) {
+            throw new UnsupportedOperationException(e);
+        }
+    }
+
+    public static <T> T nodeToValue(JsonNode node, Class<T> clz) {
+        try {
+            return jsonMapper.treeToValue(node, clz);
+        } catch (JsonProcessingException e) {
+            throw new UnsupportedOperationException(e);
+        }
+    }
+
+    public static String toStr(Object t) {
+        try {
+            return jsonMapper.writeValueAsString(t);
+        } catch (Exception e) {
+            throw new UnsupportedOperationException(e);
+        }
+    }
+
+}
+
+```
+
+![image-20240104140908792](assets/image-20240104140908792.png)
+
+注意RedisUtil的一个细节，`stringRedisTemplate`是静态的，相关的方法也都是静态的，这样其他地方用起来就方便了。
+
+![image-20240104141123315](assets/image-20240104141123315.png)
+
+![image-20240104142539994](assets/image-20240104142539994.png)
+
+虽然我们用的是`stringRedisTemplate`，但是RedisUtils支持设置object的值，以及取出任意类型对象的值，因为JsonUtils工具类里封装了方法可以实现json字符串与对象之间的相互转换。
+
+![image-20240104142803202](assets/image-20240104142803202.png)
+
+![image-20240104142742618](assets/image-20240104142742618.png)
+
+![image-20240104143152201](assets/image-20240104143152201.png)
+
+但是hutool的序列化器就不能进行转换
+
+![image-20240104143015130](assets/image-20240104143015130.png)
+
+我选择用jackson
+
+
+
+## 整合Redisson
+
+### 引入依赖
+
+`luochat-common-starter的pom`
+
+```xml
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson-spring-boot-starter</artifactId>
+</dependency>
+```
+
+### 添加配置类
+
+```java
+import org.redisson.Redisson;
+import org.redisson.api.RedissonClient;
+import org.redisson.config.Config;
+import org.springframework.boot.autoconfigure.data.redis.RedisProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import javax.annotation.Resource;
+
+@Configuration
+public class RedissonConfig {
+    @Resource
+    private RedisProperties redisProperties;
+
+    @Bean
+    public RedissonClient redissonClient() {
+        Config config = new Config();
+        config.useSingleServer()
+                .setAddress("redis://" + redisProperties.getHost() + ":" + redisProperties.getPort())
+                .setPassword(redisProperties.getPassword())
+                .setDatabase(redisProperties.getDatabase());
+        return Redisson.create(config);
+    }
+}
+```
+
+![image-20240104162501591](assets/image-20240104162501591.png)
+
+### 代码实践
+
+```java
+@Resource
+private RedissonClient redissonClient;
+@Test
+public void testRedisson() {
+    RLock lock = redissonClient.getLock("key");
+    lock.lock();
+    System.out.println();
+    lock.unlock();
+}
+```
+
+使用debug调试，观察效果
+
+
+
+
+
+## 项目线程池统一管理
+
+### 问题描述
+
+频繁的创建、销毁线程和线程池，会给系统带来额外的开销。未经池化及统一管理的线程，则会导致**系统内线程数上限不可控**。
+
+为了解决上述问题，可增加统一线程池配置
+
+
+
+### 配置统一线程池
+
+```java
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
+
+@Configuration
+@EnableAsync
+public class ThreadPoolConfig implements AsyncConfigurer {
+    /**
+     * 项目共用线程池
+     */
+    public static final String LUOCHAT_EXECUTOR = "luochatExecutor";
+    /**
+     * websocket通信线程池
+     */
+    public static final String WS_EXECUTOR = "websocketExecutor";
+
+    @Override
+    public Executor getAsyncExecutor() {
+        return luochatExecutor();
+    }
+
+    @Bean(LUOCHAT_EXECUTOR)
+    @Primary
+    public ThreadPoolTaskExecutor luochatExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setWaitForTasksToCompleteOnShutdown(true);// 线程池优雅停机的关键
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("luochat-executor-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());//默认为重要任务，队列满了就调用自己的线程来执行
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+这里面做了两件事，创建一个统一线程池，并且还通过实现`AsyncConfigurer`，设置了`@Async`注解也使用我们的统一线程池，这样方便统一管理。
+
+我们的线程池没有用`Excutors`快速创建。是因为`Excutors`创建的线程池用的无界队列，有oom的风险（小考点）。
+
+`executor.setThreadNamePrefix("mallchat-executor-")`设置线程前缀，这样排查cpu占用，死锁问题或者其他bug的时候根据线程名，可以比较容易看出是业务问题还是底层框架问题。
+
+
+
+### 优雅停机
+
+当项目关闭的时候，需要通过`jvm`的`shutdownHook`回调线程池的`destory`方法，等队列里任务执行完再停机，保证任务不丢失。
+
+我们使用的是spring管理的线程池`ThreadPoolTaskExecutor`，它继承了`ExecutorConfigurationSupport`
+
+![image-20240104165125389](assets/image-20240104165125389.png)
+
+`ExecutorConfigurationSupport`实现了spring的`DisposableBean`接口的`destroy`方法，在里面调用`executor.shutdown()`并等待线程池执行完毕。这个`destroy`方法会在`ThreadPoolTaskExecutor`生命周期结束时执行
+
+![image-20240104165336331](assets/image-20240104165336331.png)
+
+![image-20240104171035043](assets/image-20240104171035043.png)
+
+连优雅停机的事，都可以直接交给spring自己来管理了，非常方便。
+
+### 线程池使用
+
+我们放进容器的线程池设置了beanName。
+
+![image-20240104171425963](assets/image-20240104171425963.png)
+
+业务需要用时，可以根据beanName取出想用的线程池。
+
+```java
+@Resource
+@Qualifier(ThreadPoolConfig.LUOCHAT_EXECUTOR)
+private ThreadPoolTaskExecutor threadPoolTaskExecutor
+```
+
+或者是直接在方法上加上异步注解`@Async`
+
+
+
+### 异常捕获
+
+搭建我们的项目的线程池，千万别忘了一点，就是线程运行抛异常了，要怎么处理。
+
+```java
+@Resource
+@Qualifier(ThreadPoolConfig.LUOCHAT_EXECUTOR)
+private ThreadPoolTaskExecutor threadPoolTaskExecutor;
+@Test
+public void testThreadPoolTaskExecutor() {
+    threadPoolTaskExecutor.execute(() -> {
+        log.info("111");
+        throw new RuntimeException("运行时异常了");
+    });
+}
+```
+
+![image-20240104172424170](assets/image-20240104172424170.png)
+
+
+
+> 子线程执行过程中报错，不会打印错误日志，只会在控制台输出
+
+
+
+#### 异常去哪了？
+
+传统模式下，我们一般会通过try catch的方法去捕获线程的异常，并且打印到日志中。
+
+```java
+@Resource
+@Qualifier(ThreadPoolConfig.LUOCHAT_EXECUTOR)
+private ThreadPoolTaskExecutor threadPoolTaskExecutor;
+@Test
+public void testThreadPoolTaskExecutor() throws InterruptedException {
+    threadPoolTaskExecutor.execute(() -> {
+        try {
+            log.info("111");
+            throw new RuntimeException("运行时异常了");
+        } catch (RuntimeException e) {
+            log.info("异常发生",e);
+        }
+    });
+    Thread.sleep(1000);
+}
+```
+
+![image-20240104182832427](assets/image-20240104182832427.png)
+
+你会发现一个有意思的现象，当我们捕获了异常，就没有控制台的告警了，全都是日志打印。
+
+其实，如果一个异常未被捕获，从线程中抛了出来。JVM会回调一个方法`dispatchUncaughtException`
+
+```java
+ /**
+ * Dispatch an uncaught exception to the handler. This method is
+ * intended to be called only by the JVM.
+ */
+private void dispatchUncaughtException(Throwable e) {
+    getUncaughtExceptionHandler().uncaughtException(this, e);
+}
+```
+
+这个方法在`Thread`类中，会进行默认的异常处理，其实就是获取一个默认的异常处理器。默认的异常处理器是
+
+`ThreadGroup`实现的异常捕获方法。前面看到的`控制台ERR打印`，就出自这里。
+
+![image-20240104173426872](assets/image-20240104173426872.png)
+
+![image-20240104173730601](assets/image-20240104173730601.png)
+
+![image-20240104174218590](assets/image-20240104174218590.png)
+
+
+
+#### 如何捕获线程异常
+
+我们要做的很简单，就是给线程添加一个`异常捕获处理器`，以后抛了异常，就给它转成error日志。这样才能及时发现问题。
+
+```java
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/4 17:46
+ */
+@Slf4j
+public class MyUncaughtExceptionHandler implements Thread.UncaughtExceptionHandler {
+    @Override
+    public void uncaughtException(Thread t, Throwable e) {
+        log.error("Exception ", e);
+    }
+}
+```
+
+![image-20240104175610036](assets/image-20240104175610036.png)
+
+Thread有两个属性，一个实例成员变量，一个类静态变量。都可以设置异常捕获。区别在于一个生效的范围是单个thread对象，一个生效的范围是全局的thread。
+
+```java
+// null unless explicitly set
+private volatile UncaughtExceptionHandler uncaughtExceptionHandler;
+
+// null unless explicitly set
+private static volatile UncaughtExceptionHandler defaultUncaughtExceptionHandler;
+```
+
+我们一般选择给每个thread实例都加一个异常捕获。毕竟别人的thread咱们别管，只管自己创建的thread。
+
+```java
+@Test
+public void testThreadPoolTaskExecutor() throws InterruptedException {
+    Thread thread = new Thread(() -> {
+        log.info("111");
+        throw new RuntimeException("运行时异常了");
+    });
+    thread.setUncaughtExceptionHandler(new MyUncaughtExceptionHandler());
+    thread.start();
+    Thread.sleep(1000);
+}
+```
+
+![image-20240104175644834](assets/image-20240104175644834.png)
+
+
+
+#### 线程池的异常捕获
+
+我们工作中一般不直接创建线程对象，都用的线程池。这下要怎么去给线程设置异常捕获呢？
+
+用线程池的`ThreadFactory`，也就是创建线程的工厂，创建线程的时候给线程添加异常捕获。
+
+但由于Spring的封装，想要给线程工厂设置一个捕获器，可是很困难的。
+
+![image-20240104181550220](assets/image-20240104181550220.png)
+
+可以看到它自己实现了ThreadFactory。在`CustomizableThreadFactory`类的位置
+
+![image-20240104181714133](assets/image-20240104181714133.png)
+
+点进去可以看见它内部封装好的创建线程的方法
+
+![image-20240104181752870](assets/image-20240104181752870.png)
+
+压根就没有机会去设置一个线程捕获器。
+
+它的抽象类`ExecutorConfigurationSupport`将自己赋值给线程工厂，提供了一个解耦的机会。
+
+![image-20240104182018833](assets/image-20240104182018833.png)
+
+如果我们把这个线程工厂换了，那么它的线程创建方法就会失效。线程名，优先级啥的全都得我们一并做了。而我们只是想扩展一个线程捕获。
+
+这时候一个设计模式浮出脑海：**装饰器模式** 
+
+装饰器模式不会改变原有的功能，而是在功能前后做一个扩展点 。完全适合我们这次的改动。
+
+首先先写一个自己的线程工厂，把spring的线程工厂传进来。调用它创建线程，再对线程扩展设置我们的异常捕获
+
+```java
+import lombok.AllArgsConstructor;
+
+import java.util.concurrent.ThreadFactory;
+
+@AllArgsConstructor
+public class MyThreadFactory implements ThreadFactory {
+
+    public static final MyUncaughtExceptionHandler MYUNCAUGHTEXCEPTIONHANDLER = new MyUncaughtExceptionHandler();
+    private ThreadFactory original;
+
+    @Override
+    public Thread newThread(Runnable r) {
+        Threajavad thread = original.newThread(r); // 执行原来的ThreadFactory创建线程的逻辑
+        // 为创建出来的线程额外装饰上我们需要的异常捕获功能
+        thread.setUncaughtExceptionHandler(MYUNCAUGHTEXCEPTIONHANDLER);//异常捕获
+        return thread;
+    }
+}
+```
+
+![image-20240104182251280](assets/image-20240104182251280.png)
+
+第二步，替换spring线程池的线程工厂。
+
+![image-20240104182345195](assets/image-20240104182345195.png)
+
+```java
+import com.luoying.luochat.common.common.thread.MyThreadFactory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
+
+@Configuration
+@EnableAsync
+public class ThreadPoolConfig implements AsyncConfigurer {
+    /**
+     * 项目共用线程池
+     */
+    public static final String LUOCHAT_EXECUTOR = "luochatExecutor";
+    /**
+     * websocket通信线程池
+     */
+    public static final String WS_EXECUTOR = "websocketExecutor";
+
+    @Override
+    public Executor getAsyncExecutor() {
+        return luochatExecutor();
+    }
+
+    @Bean(LUOCHAT_EXECUTOR)
+    @Primary
+    public ThreadPoolTaskExecutor luochatExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setWaitForTasksToCompleteOnShutdown(true);// 线程池优雅停机
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("luochat-executor-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());//默认为重要任务，队列满了就调用自己的线程来执行
+        executor.setThreadFactory(new MyThreadFactory(executor));
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+最后测试
+
+```java
+@Resource
+@Qualifier(ThreadPoolConfig.LUOCHAT_EXECUTOR)
+private ThreadPoolTaskExecutor threadPoolTaskExecutor;
+
+@Test
+public void testThreadPoolTaskExecutor() throws InterruptedException {
+    threadPoolTaskExecutor.execute(() -> {
+        log.info("111");
+        throw new RuntimeException("运行时异常了");
+    });
+    Thread.sleep(1000);
+}
+```
+
+![image-20240104182526956](assets/image-20240104182526956.png)
+
+
+
+### 总结
+
+1. 你是如何做线程池统一管理的（引出你对线程池参数的理解）
+2. 你是如果做优雅停机的（可自己写，也可使用spring自带线程池，项目都用到了）
+3. 你是如何做异常捕获日志打印，更好的监控线程运行的？
+4. 你又是如何查看spring线程池源码，用装饰器更优雅去添加异常捕获功能的（引出你对源码，设计模式的理解）
+
+需要去好好夯实**JUC**基础，设计模式基础，源码基础。
