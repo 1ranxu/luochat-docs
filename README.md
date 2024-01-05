@@ -5008,3 +5008,105 @@ io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandshakeHandler
 协议本来就是用来双方的一个交互规范的定义，却被我们用来传token。当你发现底层的框架要费那么大力才能改造的时候，也许就是我们错了。
 
 所以我决定摒弃这个方法。
+
+
+
+#### url传参
+
+![image-20240105173731023](assets/image-20240105173731023.png)
+
+我们选择了另一种传参方式，在url后拼接参数。
+
+这样是在握手升级前，从http的请求中，获取到url再拿到参数
+
+```java
+import cn.hutool.core.net.url.UrlBuilder;
+import com.luoying.luochat.common.websocket.NettyUtil;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.http.HttpRequest;
+
+import java.util.Optional;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 13:29
+ */
+public class MyTokenCollectHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        if (msg instanceof HttpRequest) { // 如果是http请求，说明需要进行握手升级
+            final HttpRequest request = (HttpRequest) msg; 
+            UrlBuilder urlBuilder = UrlBuilder.ofHttp(request.getUri());
+            Optional<String> tokenOptional = Optional.ofNullable(urlBuilder)
+                    .map(UrlBuilder::getQuery)
+                    .map(urlQuery -> urlQuery.get("token"))
+                    .map(CharSequence::toString);
+            // 如果token存在，保存token
+            tokenOptional.ifPresent(s -> NettyUtil.setValueToAttr(ctx.channel(), NettyUtil.TOKEN, s));
+            // 还原request的路径
+            request.setUri(urlBuilder.getPath().toString());
+        }
+        ctx.fireChannelRead(msg);
+    }
+}
+```
+
+通过hutool的api，很容易的就从一串url中取出query参数，也就是我们的token，把它绑定到channel。
+
+这样前端改起来，就是拼接下参数，稍微麻烦点，对我们后端来说，可太轻松了。
+
+最后调试完毕，也能够通过
+
+切记，request的uri必须要将这个token参数移除，不然后面的`WebSocketServerProtocolHandler`处理器匹配不上websocketPath了。
+
+![image-20240105174947936](assets/image-20240105174947936.png)
+
+![image-20240105175143433](assets/image-20240105175143433.png)
+
+![image-20240105175825460](assets/image-20240105175825460.png)
+
+这是我们自己封装工具类，可以把value设置到channel的附件，也可以取出附件中的value
+
+```java
+import io.netty.channel.Channel;
+import io.netty.util.Attribute;
+import io.netty.util.AttributeKey;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 16:43
+ */
+public class NettyUtil {
+    public static AttributeKey<String> TOKEN = AttributeKey.valueOf("token");
+
+    public static <T> void setValueToAttr(Channel channel,AttributeKey<T> key,T vlaue){
+        Attribute<T> attr = channel.attr(key);
+        attr.set(vlaue);
+    }
+
+    public static <T> T getValueInAttr(Channel channel,AttributeKey<T> key){
+        Attribute<T> attr = channel.attr(key);
+        return attr.get();
+    }
+}
+```
+
+![image-20240105180052890](assets/image-20240105180052890.png)
+
+
+
+### 总结
+
+从主动认证，变成握手认证，能提到认证效率，从三次数据传输变成两次，是我们做这件事的理由
+
+在做的过程中，我们又深入理解了websocket的协议升级过程，基于对这点的掌握，讨论出三个方案。
+
+对netty的握手协议改动，我们又深入去阅读它的协议升级源码，发现功能可以实现但不够优雅的时候，又主动反思，他们不开发这样的功能，是不是这条路本就不适合？
+
+改成url参数的方式来传递token，最终实现效果。
+
+同时还涉及到netty中的传参靠channel自带的附件功能来绑定。
+
+这些经历变成自己亲身体验后，算是一个对技术探索的亮点
