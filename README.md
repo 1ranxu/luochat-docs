@@ -5110,3 +5110,723 @@ public class NettyUtil {
 同时还涉及到netty中的传参靠channel自带的附件功能来绑定。
 
 这些经历变成自己亲身体验后，算是一个对技术探索的亮点
+
+
+
+
+
+## 背包表&物品表设计
+
+目前用户的背包拥有改名卡和徽章，徽章可以在聊天界面以及成员列表出现，后期还会出现在用户名片上。
+
+### 表设计
+
+![image-20240105193806126](assets/image-20240105193806126.png)
+
+- 我们将徽章，改名卡这些东西都抽象成了物品表`item_config`。后续可能还会有聊天框样式等等，加新的`type`就好了。
+
+- 用户得到的物品，就在自己的背包表 `user_backpack`。这样的设计，可以支持后期任意物品的扩展。
+
+- 背包表还有个字段，生效或者失效。对于有过期时间的物品，又或者是使用完就`失效`的物品，就可以用这个字段`status`。
+
+- 根据图表关系，可以看出，`用户`和`物品`是多对多的。一个用户可以有多个物品，一个物品也可以被多个用户领取。他们的关系存在`背包表`这样一个中间表
+
+```sql
+CREATE TABLE `item_config`  (
+  `id` bigint(20) UNSIGNED NOT NULL COMMENT 'id',
+  `type` int(11) NOT NULL COMMENT '物品类型 1改名卡 2徽章',
+  `img` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '物品图片',
+  `describe` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT '物品功能描述',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_create_time`(`create_time`) USING BTREE,
+  INDEX `idx_update_time`(`update_time`) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '功能物品配置表' ROW_FORMAT = Dynamic;
+CREATE TABLE `user_backpack`  (
+  `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `uid` bigint(20) NOT NULL COMMENT 'uid',
+  `item_id` bigint(20) NOT NULL COMMENT '物品id',
+  `status` int(11) NOT NULL COMMENT '使用状态 0.待使用 1已使用',
+  `idempotent` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '幂等号',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE INDEX `uniq_idempotent`(`idempotent`) USING BTREE,
+  INDEX `idx_uid`(`uid`) USING BTREE,
+  INDEX `idx_create_time`(`create_time`) USING BTREE,
+  INDEX `idx_update_time`(`update_time`) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '用户背包表' ROW_FORMAT = Dynamic;
+INSERT INTO `item_config` VALUES (1, 1, NULL, '用户可以使用改名卡，更改自己的名字。luochat名称全局唯一，快抢订你的专属昵称吧', '2023-03-25 22:27:30.511', '2023-03-25 22:27:30.511');
+INSERT INTO `item_config` VALUES (2, 2, 'https://cdn-icons-png.flaticon.com/128/1533/1533913.png', '爆赞徽章，单条消息被点赞超过10次，即可获得', '2023-05-07 17:50:31.090', '2023-05-07 18:12:05.824');
+INSERT INTO `item_config` VALUES (3, 2, 'https://cdn-icons-png.flaticon.com/512/6198/6198527.png ', '聊天室前10名注册的用户才能获得的专属徽章', '2023-05-07 17:50:31.100', '2023-05-07 18:12:01.448');
+INSERT INTO `item_config` VALUES (4, 2, 'https://cdn-icons-png.flaticon.com/512/10232/10232583.png', '聊天室前100名注册的用户才能获得的专属徽章', '2023-05-07 17:50:31.109', '2023-05-07 17:56:36.059');
+```
+
+
+
+### 代码生成
+
+```java
+import com.baomidou.mybatisplus.annotation.DbType;
+import com.baomidou.mybatisplus.annotation.FieldFill;
+import com.baomidou.mybatisplus.generator.AutoGenerator;
+import com.baomidou.mybatisplus.generator.config.DataSourceConfig;
+import com.baomidou.mybatisplus.generator.config.GlobalConfig;
+import com.baomidou.mybatisplus.generator.config.PackageConfig;
+import com.baomidou.mybatisplus.generator.config.StrategyConfig;
+import com.baomidou.mybatisplus.generator.config.po.TableFill;
+import com.baomidou.mybatisplus.generator.config.rules.NamingStrategy;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class MPGenerator {
+    public static void main(String[] args) {
+        //代码生成器
+        AutoGenerator autoGenerator = new AutoGenerator();
+
+        //数据源配置
+        DataSourceConfig dataSourceConfig = new DataSourceConfig();
+        dataSourceConfig.setDbType(DbType.MYSQL);//指定数据库类型
+        //---------------------------数据源-----------------------------------
+        assembleDev(dataSourceConfig);//配置数据源
+        autoGenerator.setDataSource(dataSourceConfig);
+
+        //全局配置
+        GlobalConfig globalConfig = new GlobalConfig();
+        globalConfig.setOpen(false);
+        //todo 要改输出路径
+        globalConfig.setOutputDir(System.getProperty("user.dir") + "/luochat-chat-server/src/main/java");
+        //设置作者名字
+        globalConfig.setAuthor("<a href=\"https://github.com/1ranxu\">luoying</a>");
+        //去掉service的I前缀,一般只需要设置service就行
+        globalConfig.setServiceImplName("%sDao");
+        autoGenerator.setGlobalConfig(globalConfig);
+
+        //包配置
+        PackageConfig packageConfig = new PackageConfig();
+        packageConfig.setParent("com.luoying.luochat.common.user");//自定义包的路径
+        packageConfig.setEntity("domain.entity");
+        packageConfig.setMapper("mapper");
+        packageConfig.setController("controller");
+        packageConfig.setServiceImpl("dao");
+        autoGenerator.setPackageInfo(packageConfig);
+
+        //策略配置
+        StrategyConfig strategyConfig = new StrategyConfig();
+        //是否使用Lombok
+        strategyConfig.setEntityLombokModel(true);
+        //包，列的命名规则，使用驼峰规则
+        strategyConfig.setNaming(NamingStrategy.underline_to_camel);
+//        strategyConfig.setTablePrefix("t_");
+        strategyConfig.setColumnNaming(NamingStrategy.underline_to_camel);
+        //字段和表注解
+        strategyConfig.setEntityTableFieldAnnotationEnable(true);
+        //todo 这里修改需要自动生成的表结构
+        strategyConfig.setInclude(
+                "item_config",
+                "user_backpack"
+        );
+        //自动填充字段,在项目开发过程中,例如创建时间，修改时间,每次，都需要我们来指定，太麻烦了,设置为自动填充规则，就不需要我们赋值咯
+        List<TableFill> list = new ArrayList<TableFill>();
+        TableFill tableFill1 = new TableFill("create_time", FieldFill.INSERT);
+        TableFill tableFill2 = new TableFill("update_time", FieldFill.INSERT_UPDATE);
+        list.add(tableFill1);
+        list.add(tableFill2);
+
+        //strategyConfig.setTableFillList(list);
+        autoGenerator.setStrategy(strategyConfig);
+
+        //执行
+        autoGenerator.execute();
+
+    }
+    //todo 这里修改你的数据源
+    public static void assembleDev(DataSourceConfig dataSourceConfig) {
+        dataSourceConfig.setDriverName("com.mysql.cj.jdbc.Driver");
+        dataSourceConfig.setUsername("root");
+        dataSourceConfig.setPassword("115474287zxcczld");
+        dataSourceConfig.setUrl("jdbc:mysql://192.168.253.128:3306/luochat?useUnicode=true&characterEncoding=utf-8&useSSL=true&serverTimezone=UTC");
+    }
+}
+```
+
+![image-20240105195753487](assets/image-20240105195753487.png)
+
+![image-20240105195830953](assets/image-20240105195830953.png)
+
+![image-20240105195844755](assets/image-20240105195844755.png)
+
+
+
+## 整合swagger
+
+### 引入依赖
+
+`luochat-common-starter的pom`
+
+**Knife4j**美化插件其中自带**swagger**的依赖了
+
+```
+<dependency>
+    <groupId>com.github.xiaoymin</groupId>
+    <artifactId>knife4j-spring-boot-starter</artifactId>
+    <version>2.0.9</version>
+</dependency>
+```
+
+
+
+### 添加配置类
+
+![image-20240105204940613](assets/image-20240105204940613.png)
+
+```java
+import org.springframework.boot.actuate.autoconfigure.endpoint.web.CorsEndpointProperties;
+import org.springframework.boot.actuate.autoconfigure.endpoint.web.WebEndpointProperties;
+import org.springframework.boot.actuate.autoconfigure.web.server.ManagementPortType;
+import org.springframework.boot.actuate.endpoint.ExposableEndpoint;
+import org.springframework.boot.actuate.endpoint.web.*;
+import org.springframework.boot.actuate.endpoint.web.annotation.ControllerEndpointsSupplier;
+import org.springframework.boot.actuate.endpoint.web.annotation.ServletEndpointsSupplier;
+import org.springframework.boot.actuate.endpoint.web.servlet.WebMvcEndpointHandlerMapping;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.Profiles;
+import org.springframework.util.StringUtils;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.config.annotation.EnableWebMvc;
+import org.springframework.web.servlet.config.annotation.ViewControllerRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+import springfox.documentation.builders.ApiInfoBuilder;
+import springfox.documentation.builders.PathSelectors;
+import springfox.documentation.builders.RequestHandlerSelectors;
+import springfox.documentation.service.Contact;
+import springfox.documentation.spi.DocumentationType;
+import springfox.documentation.spring.web.plugins.Docket;
+import springfox.documentation.swagger2.annotations.EnableSwagger2WebMvc;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+
+/**
+ * Description:
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 20:10
+ */
+@Configuration
+@EnableSwagger2WebMvc
+public class SwaggerConfig {
+    @Bean(value = "defaultApi2")
+    Docket docket() {
+        return new Docket(DocumentationType.SWAGGER_2)
+                //配置网站的基本信息
+                .apiInfo(new ApiInfoBuilder()
+                        //网站标题
+                        .title("luochat接口文档")
+                        //标题后面的版本号
+                        .version("v1.0")
+                        .description("luochat接口文档")
+                        //联系人信息
+                        .contact(new Contact("luoying", "<https://github.com/1ranxu>", "263989312@qq.com"))
+                        .build())
+                .select()
+                //指定接口的位置
+                .apis(RequestHandlerSelectors
+                        .withClassAnnotation(RestController.class)
+                )
+                .paths(PathSelectors.any())
+                .build();
+    }
+    @Bean
+    public WebMvcEndpointHandlerMapping webEndpointServletHandlerMapping(WebEndpointsSupplier webEndpointsSupplier, ServletEndpointsSupplier servletEndpointsSupplier, ControllerEndpointsSupplier controllerEndpointsSupplier, EndpointMediaTypes endpointMediaTypes, CorsEndpointProperties corsProperties, WebEndpointProperties webEndpointProperties, Environment environment) {
+        List<ExposableEndpoint<?>> allEndpoints = new ArrayList();
+        Collection<ExposableWebEndpoint> webEndpoints = webEndpointsSupplier.getEndpoints();
+        allEndpoints.addAll(webEndpoints);
+        allEndpoints.addAll(servletEndpointsSupplier.getEndpoints());
+        allEndpoints.addAll(controllerEndpointsSupplier.getEndpoints());
+        String basePath = webEndpointProperties.getBasePath();
+        EndpointMapping endpointMapping = new EndpointMapping(basePath);
+        boolean shouldRegisterLinksMapping = this.shouldRegisterLinksMapping(webEndpointProperties, environment, basePath);
+        return new WebMvcEndpointHandlerMapping(endpointMapping, webEndpoints, endpointMediaTypes, corsProperties.toCorsConfiguration(), new EndpointLinksResolver(allEndpoints, basePath), shouldRegisterLinksMapping, null);
+    }
+    private boolean shouldRegisterLinksMapping(WebEndpointProperties webEndpointProperties, Environment environment, String basePath) {
+        return webEndpointProperties.getDiscovery().isEnabled() && (StringUtils.hasText(basePath) || ManagementPortType.get(environment).equals(ManagementPortType.DIFFERENT));
+    }
+}
+```
+
+
+
+###  修改配置文件
+
+如果运行报错：`Failed to start bean ‘documentationPluginsBootstrapper`
+
+是因为 SpringBoot 2.6.x后会有兼容问题，SpringBoot 2.6 以后将SpringMVC 默认路径匹配策略从 AntPathMatcher 更改为          PathPatternParser，导致出错。
+
+所以要么降 SpringBoot 的版本，要么 yml 文件加上一个配置。
+
+`application.yml`
+
+```yml
+spring:
+  mvc:
+    pathmatch:
+      matching-strategy: ANT_PATH_MATCHER
+```
+
+
+
+### 使用方法
+
+![image-20240105204745894](assets/image-20240105204745894.png)
+
+```java
+import io.swagger.annotations.ApiModel;
+import io.swagger.annotations.ApiModelProperty;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 20:10
+ */
+@Data
+@EqualsAndHashCode(callSuper = false)
+@ApiModel(value="用户信息响应对象", description="用户信息")
+public class UserInfoResp {
+    @ApiModelProperty(value = "uid")
+    private Long id;
+    @ApiModelProperty(value = "用户昵称")
+    private String name;
+    @ApiModelProperty(value = "用户头像")
+    private String avatar;
+    @ApiModelProperty(value = "用户性别")
+    private Integer sex;
+    @ApiModelProperty(value = "剩余改名次数")
+    private Integer modifyNameChance;
+}
+```
+
+```java
+import com.luoying.luochat.common.user.domain.vo.resp.UserInfoResp;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * <p>
+ * 用户表 前端控制器
+ * </p>
+ *
+ * @author <a href="https://github.com/1ranxu">luoying</a>
+ * @since 2024-01-02
+ */
+@RestController
+@RequestMapping("/capi/user")
+@Api(tags = "用户相关接口")
+public class UserController {
+
+    @GetMapping("/userInfo")
+    @ApiOperation("获取用户个人信息")
+    public UserInfoResp getUserInfo(@RequestParam Long uid) {
+        return null;
+    }
+}
+```
+
+访问http://localhost:8080/doc.html
+
+![image-20240105212802752](assets/image-20240105212802752.png)
+
+![image-20240105212820807](assets/image-20240105212820807.png)
+
+![image-20240105212847411](assets/image-20240105212847411.png)
+
+
+
+## http前后端交互协议
+
+### 接口路径
+
+我们的项目接口URI设计规范是这样的
+
+/capi/chat/public/room/page
+
+`/capi`用来区分是c端接口还是b端接口，或者是内部接口，可能的值还有`/bapi`,`/iapi`
+
+`/chat`是接口的业务领域，可能的值还有`/user` `/cart ` `/order`等
+
+`/public`是接口权限，`/public` 代表公开接口，未登录也可访问；`/admin`接口代表需要后台的管理权限，其他都是需要登录态。这样通过一个接口URI就很容易的分析出接口需要的权限，也方便后续拦截器的判断。
+
+接口即文档，路径即权限
+
+`/room/page`后面就是具体的每个接口的职责了通过后续的命令和请求类型共同表示接口功能。
+
+`分页`：get+/业务资源/page
+
+`列表`：get+/业务资源/list
+
+`详情`：get+/业务资源
+
+`提交`：post+/业务资源
+
+`修改`：put+/业务资源
+
+
+
+### 请求头
+
+对于登录用户，前端的请求必须附带请求头
+
+```
+Authorization:"Bearer "+{{token}}   //用户登录状态标识，登录成功后返回的值
+```
+
+
+
+### 前端请求
+
+#### PageBaseReq
+
+普通分页请求:必须有第几页和页面大小
+
+```java
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import io.swagger.annotations.ApiModel;
+import io.swagger.annotations.ApiModelProperty;
+import lombok.Data;
+
+import javax.validation.constraints.Max;
+import javax.validation.constraints.Min;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 21:10
+ */
+@Data
+@ApiModel("基础翻页请求")
+public class PageBaseReq {
+
+    @ApiModelProperty("页面大小")
+    @Min(0)
+    @Max(50)
+    private Integer pageSize = 10;
+
+    @ApiModelProperty("页面索引（从1开始）")
+    private Integer pageNo = 1;
+
+    /**
+     * 获取mybatisPlus的page
+     *
+     * @return
+     */
+    public Page plusPage() {
+        return new Page(pageNo, pageSize);
+    }
+}
+```
+
+
+
+#### CursorPageBaseReq
+
+游标分页请求：必须有需要的条数，以及游标的位置。
+
+```java
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import io.swagger.annotations.ApiModel;
+import io.swagger.annotations.ApiModelProperty;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.apache.commons.lang3.StringUtils;
+
+import javax.validation.constraints.Max;
+import javax.validation.constraints.Min;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 21:10
+ */
+@Data
+@ApiModel("游标翻页请求")
+@AllArgsConstructor
+@NoArgsConstructor
+public class CursorPageBaseReq {
+
+    @ApiModelProperty("页面大小")
+    @Min(0)
+    @Max(100)
+    private Integer pageSize = 10;
+
+    @ApiModelProperty("游标（初始为null，后续请求附带上次翻页的游标）")
+    private String cursor;
+
+    public Page plusPage() {
+        return new Page(1, this.pageSize);
+    }
+
+    @JsonIgnore
+    public Boolean isFirstPage() {
+        return StringUtils.isEmpty(cursor);
+    }
+}
+```
+
+
+
+### 后端返回
+
+#### ApiResult
+
+后端返回的基础对象是`ApiResult`，是我们和前端的约定
+
+```java
+import io.swagger.annotations.ApiModel;
+import io.swagger.annotations.ApiModelProperty;
+import lombok.Data;
+
+/**
+ * Description: 通用返回体
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 21:10
+ */
+@Data
+@ApiModel("基础返回体")
+public class ApiResult<T> {
+    @ApiModelProperty("成功标识true or false")
+    private Boolean success;
+    @ApiModelProperty("错误码")
+    private Integer errCode;
+    @ApiModelProperty("错误消息")
+    private String errMsg;
+    @ApiModelProperty("返回对象")
+    private T data;
+
+    public static <T> ApiResult<T> success() {
+        ApiResult<T> result = new ApiResult<T>();
+        result.setData(null);
+        result.setSuccess(Boolean.TRUE);
+        return result;
+    }
+
+    public static <T> ApiResult<T> success(T data) {
+        ApiResult<T> result = new ApiResult<T>();
+        result.setData(data);
+        result.setSuccess(Boolean.TRUE);
+        return result;
+    }
+
+    public static <T> ApiResult<T> fail(Integer code, String msg) {
+        ApiResult<T> result = new ApiResult<T>();
+        result.setSuccess(Boolean.FALSE);
+        result.setErrCode(code);
+        result.setErrMsg(msg);
+        return result;
+    }
+
+
+    public boolean isSuccess() {
+        return this.success;
+    }
+}
+```
+
+前端识别到`success`为`false`的时候，就会使用`toast`提示我们的`errMsg`。这样后端在进行一些校验，频控的时候，就可以很方便的对前端用户进行提示。
+
+
+
+#### PageBaseResp
+
+普通分页：针对于翻页的返回体，返回的东西就会多些
+
+```java
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import io.swagger.annotations.ApiModel;
+import io.swagger.annotations.ApiModelProperty;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 21:10
+ */
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@ApiModel("基础翻页返回")
+public class PageBaseResp<T> {
+
+    @ApiModelProperty("当前页数")
+    private Integer pageNo;
+
+    @ApiModelProperty("每页查询数量")
+    private Integer pageSize;
+
+    @ApiModelProperty("总记录数")
+    private Long totalRecords;
+
+    @ApiModelProperty("是否最后一页")
+    private Boolean isLast = Boolean.FALSE;
+
+    @ApiModelProperty("数据列表")
+    private List<T> list;
+
+
+    public static <T> PageBaseResp<T> empty() {
+        PageBaseResp<T> r = new PageBaseResp<>();
+        r.setPageNo(1);
+        r.setPageSize(0);
+        r.setIsLast(true);
+        r.setTotalRecords(0L);
+        r.setList(new ArrayList<>());
+        return r;
+    }
+
+    public static <T> PageBaseResp<T> init(Integer pageNo, Integer pageSize, Long totalRecords, Boolean isLast, List<T> list) {
+        return new PageBaseResp<>(pageNo, pageSize, totalRecords, isLast, list);
+    }
+
+    public static <T> PageBaseResp<T> init(Integer pageNo, Integer pageSize, Long totalRecords, List<T> list) {
+        return new PageBaseResp<>(pageNo, pageSize, totalRecords, isLastPage(totalRecords, pageNo, pageSize), list);
+    }
+
+    public static <T> PageBaseResp<T> init(IPage<T> page) {
+        return init((int) page.getCurrent(), (int) page.getSize(), page.getTotal(), page.getRecords());
+    }
+
+    public static <T> PageBaseResp<T> init(IPage page, List<T> list) {
+        return init((int) page.getCurrent(), (int) page.getSize(), page.getTotal(), list);
+    }
+
+    public static <T> PageBaseResp<T> init(PageBaseResp resp, List<T> list) {
+        return init(resp.getPageNo(), resp.getPageSize(), resp.getTotalRecords(), resp.getIsLast(), list);
+    }
+
+    /**
+     * 是否是最后一页
+     */
+    public static Boolean isLastPage(long totalRecords, int pageNo, int pageSize) {
+        if (pageSize == 0) {
+            return false;
+        }
+        long pageTotal = totalRecords / pageSize + (totalRecords % pageSize == 0 ? 0 : 1);
+        return pageNo >= pageTotal ? true : false;
+    }
+}
+
+```
+
+#### CursorPageBaseResp
+
+游标翻页返回
+
+```java
+import cn.hutool.core.collection.CollectionUtil;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import io.swagger.annotations.ApiModel;
+import io.swagger.annotations.ApiModelProperty;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 21:10
+ */
+@Data
+@ApiModel("游标翻页返回")
+@AllArgsConstructor
+@NoArgsConstructor
+public class CursorPageBaseResp<T> {
+
+    @ApiModelProperty("游标（下次翻页带上这参数）")
+    private String cursor;
+
+    @ApiModelProperty("是否最后一页")
+    private Boolean isLast = Boolean.FALSE;
+
+    @ApiModelProperty("数据列表")
+    private List<T> list;
+
+    public static <T> CursorPageBaseResp<T> init(CursorPageBaseResp cursorPage, List<T> list) {
+        CursorPageBaseResp<T> cursorPageBaseResp = new CursorPageBaseResp<T>();
+        cursorPageBaseResp.setIsLast(cursorPage.getIsLast());
+        cursorPageBaseResp.setList(list);
+        cursorPageBaseResp.setCursor(cursorPage.getCursor());
+        return cursorPageBaseResp;
+    }
+
+    @JsonIgnore
+    public Boolean isEmpty() {
+        return CollectionUtil.isEmpty(list);
+    }
+
+    public static <T> CursorPageBaseResp<T> empty() {
+        CursorPageBaseResp<T> cursorPageBaseResp = new CursorPageBaseResp<T>();
+        cursorPageBaseResp.setIsLast(true);
+        cursorPageBaseResp.setList(new ArrayList<T>());
+        return cursorPageBaseResp;
+    }
+
+}
+```
+
+![image-20240105213328935](assets/image-20240105213328935.png)
+
+
+
+### 修改UserController
+
+```java
+import com.luoying.luochat.common.common.domain.vo.resp.ApiResult;
+import com.luoying.luochat.common.user.domain.vo.resp.UserInfoResp;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * <p>
+ * 用户表 前端控制器
+ * </p>
+ *
+ * @author <a href="https://github.com/1ranxu">luoying</a>
+ * @since 2024-01-02
+ */
+@RestController
+@RequestMapping("/capi/user")
+@Api(tags = "用户相关接口")
+public class UserController {
+
+    @GetMapping("/userInfo")
+    @ApiOperation("获取用户个人信息")
+    public ApiResult<UserInfoResp> getUserInfo(@RequestParam Long uid) {
+        return null;
+    }
+}
+```
+
+![image-20240105212958749](assets/image-20240105212958749.png)
+
+![image-20240105213127647](assets/image-20240105213127647.png)
+
+![image-20240105213149411](assets/image-20240105213149411.png)
