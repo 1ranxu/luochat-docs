@@ -4884,3 +4884,127 @@ http请求携带token =》对channel连接进行认证
 这样三次交互才完成用户的认证，能不能给他缩短一下，在前端发送连接建立请求的时候，就附带token信息，进行一个握手认证？
 
 ![image-20240104223539731](assets/image-20240104223539731.png)
+
+
+
+### 调研
+
+首先我们要了解websocket的请求原理，它是通过http请求来和后端连接的，会有一个协议升级的过程，升级后就变成了websocket连接。参考[协议升级过程](https://code84.com/325018.html)
+
+所以我们要抓住机会，在建立连接的时候，就像从http请求中获取相关的参数一样获取token。
+
+**前端有哪些机会传token这个值呢？**
+
+1. 如果它是一个http请求，可以把token放在请求头里，但是new出websocket的时候就直接发出请求了，没有看见哪里可以设置token
+
+![image-20240105130040396](assets/image-20240105130040396.png)
+
+2. 把token拼接在域名的后面作为参数传递。
+
+![image-20240105130225049](assets/image-20240105130225049.png)
+
+3. 我们可以看见websocket其实有两个参数，第二个参数叫protocols，不管它是什么，反正能存数据，后端也能取出。我们可以把token作为websocket的第二个参数
+
+![image-20240105130504005](assets/image-20240105130504005.png)
+
+#### protocols传参
+
+[参考文章](https://blog.csdn.net/qq_45476500/article/details/124180195)
+
+协议升级过程和参考文章中提到，前端传的第二个参数会以请求头的形式携带在请求中（Sec-Websocket-Protocol），后端可以通过获取这个请求头的值拿到token，但是后端返回响应的时候，我们也需要把响应头（Sec-Websocket-Protocol）设置成相同的值（token）返回，这样才能表明双端的协议一致，握手成功。
+
+前端发送这样一个请求，后端需要重写握手的逻辑
+
+![image-20240105140050349](assets/image-20240105140050349.png)
+
+参考代码实现
+
+握手的时候取出token，设置进channel里作为附件绑定。同时将token设置回协议头，然后返回响应。最后发送握手完成事件，下游处理器监听该事件进行下一步处理。
+
+```java
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.http.HttpObject;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.websocketx.WebSocketServerHandshaker;
+import io.netty.handler.codec.http.websocketx.WebSocketServerHandshakerFactory;
+import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
+import io.netty.util.Attribute;
+import io.netty.util.AttributeKey;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 13:29
+ */
+public class MyHandShakeHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        final HttpObject httpObject = (HttpObject) msg;
+        if (httpObject instanceof HttpRequest) { // 如果是http请求，说明需要进行握手升级
+            final HttpRequest req = (HttpRequest) httpObject;
+            //从请求头Sec-Websocket-Protocol取出token
+            String token = req.headers().get("Sec-WebSocket-Protocol");
+            // 把token设置到channel的附件中，这样下游处理器监听到握手完成事件，就可以从附件中取出token进行认证
+            Attribute<Object> token1 = ctx.channel().attr(AttributeKey.valueOf("token"));
+            token1.set(token);
+            // 构建websocket握手处理器
+            final WebSocketServerHandshakerFactory wsFactory = new WebSocketServerHandshakerFactory(
+                    req.getUri(),
+                    token, false);// 将token作为值设置到响应头
+
+            final WebSocketServerHandshaker handshaker = wsFactory.newHandshaker(req);
+            if (handshaker == null) {
+                WebSocketServerHandshakerFactory.sendUnsupportedVersionResponse(ctx.channel());
+            } else {
+                // 这个handler只在握手的时候执行一次，后面都不需要了，可移除
+                ctx.pipeline().remove(this);
+
+                final ChannelFuture handshakeFuture = handshaker.handshake(ctx.channel(), req);
+                handshakeFuture.addListener(new ChannelFutureListener() { // 发送回应事件
+                    @Override
+                    public void operationComplete(ChannelFuture future) {
+                        if (!future.isSuccess()) {
+                            ctx.fireExceptionCaught(future.cause());
+                        } else {
+                            // 发送握手成功事件
+                            ctx.fireUserEventTriggered(
+                                    WebSocketServerProtocolHandler.ServerHandshakeStateEvent.HANDSHAKE_COMPLETE);
+                        }
+                    }
+                });
+            }
+        } else
+            ctx.fireChannelRead(msg);
+    }
+}
+```
+
+![image-20240105141517110](assets/image-20240105141517110.png)
+
+我们可以握手完成事件里就直接拿到token，进行认证了。
+
+![image-20240105141643191](assets/image-20240105141643191.png)
+
+这样调试后，是能正常取出token进行认证的，一切都没有问题，但是它不够优雅。
+
+我们是参考了netty提供的一个握手处理类才写出自定义握手处理器的。
+
+io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandshakeHandler
+
+![image-20240105142548212](assets/image-20240105142548212.png)
+
+`WebSocketServerProtocolHandshakeHandler`和我们自定义的握手处理器的唯一区别在于，它返回的响应是serverConfig的protocols（是写死的），如果和我们前端传参的子协议不一致，会导致握手失败。所以我们才需要自定义握手处理器，不让它返回serverConfig的protocols，而是返回我们的传参，这样就一致了
+
+这个协议是在哪写死的呢？
+
+添加这个协议升级模块的时候，就写死了，或者不传就是null。
+
+![image-20240105143301127](assets/image-20240105143301127.png)
+
+因为netty的这个握手模块无法灵活的传protocols，也没开放继承的扩展。我们只能替换它，自己自定义一个握手的handler，把它的代码都复制过来，只改动一点。这样虽然能够实现功能，但是不由的让我思考，我们这么做是不是就是错的？？？
+
+协议本来就是用来双方的一个交互规范的定义，却被我们用来传token。当你发现底层的框架要费那么大力才能改造的时候，也许就是我们错了。
+
+所以我决定摒弃这个方法。
