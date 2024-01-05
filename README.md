@@ -2943,7 +2943,7 @@ public class LoginServiceImpl implements LoginService {
         if (Objects.isNull(uid)) {
             return null;
         }
-        String tokenInRedis = RedisUtils.get(getUserTokenKey(uid));
+        String tokenInRedis = RedisUtils.getStr(getUserTokenKey(uid));
         if (StrUtil.isBlank(tokenInRedis)) {
             return null;
         }
@@ -2959,11 +2959,11 @@ public class LoginServiceImpl implements LoginService {
 }
 ```
 
-这时候会生成用户的token。然后将连接标识为登录连接.就变成了
+login方法生成用户的token，设置到用户信息里，返回给前端，前端保存token。前端请求后端时，携带token，后端解析token获取有效的uid
 
 ![image-20240103143810215](assets/image-20240103143810215.png)
 
-为什么还需要一个在线用户管理呢？
+为什么还需要一个在线uid管理呢？
 
 因为用户可能在多端登录，一个uid就可能会多个连接。思考两个场景：用户所有连接都下线，才能算用户下线；私聊推送用户的时候，需要推送某个uid的所有连接。都需要额外有个uid作为key的关系映射map。
 
@@ -3428,7 +3428,7 @@ public class RedisUtils {
      * @param key 键
      * @return 值
      */
-    public static String get(String key) {
+    private static String get(String key) {
         return key == null ? null : stringRedisTemplate.opsForValue().get(key);
     }
 
@@ -4842,3 +4842,45 @@ public void testThreadPoolTaskExecutor() throws InterruptedException {
 4. 你又是如何查看spring线程池源码，用装饰器更优雅去添加异常捕获功能的（引出你对源码，设计模式的理解）
 
 需要去好好夯实**JUC**基础，设计模式基础，源码基础。
+
+
+
+## 握手认证
+
+### 背景
+
+项目的用户认证流程
+
+http请求携带token =》对channel连接进行认证
+
+#### http请求携带token
+
+每次请求都需要用户携带token，在拦截器校验用户登录态。
+
+#### 对channel连接进行认证
+
+用户在首次扫码登录的时候，后端会将`channel`（连接）关联上uid。这样后期对用户定向推送，才知道要把消息推到那个`channel`上。
+
+但是`channel`是个很不稳定的东西。前端只要稍微刷新页面，`channel`就断开了。就需要重连。重连的`channel`要怎么知道它是谁呢？总不可能让用户再重新扫码登录吧？
+
+好在前端登录后就保存了`token`，他只需要拿着`token`从`channel`发送过来认证一下，我们就又能建立起`channel`和uid的映射关系了。
+
+### 现状
+
+![image-20240104220709844](assets/image-20240104220709844.png)
+
+![image-20240104221421379](assets/image-20240104221421379.png)
+
+![image-20240104221622701](assets/image-20240104221622701.png)
+
+![image-20240104221818329](assets/image-20240104221818329.png)
+
+![image-20240104222419197](assets/image-20240104222419197.png)
+
+我们目前的前后端交互，前端和后端建立websocket连接后，前端如果storage里有存token，就会给后端发送一个认证消息，后端校验完就会返回成功或者失效，如果失效，前端会清空token，并提示用户登录。
+
+![image-20240104223434202](assets/image-20240104223434202.png)
+
+这样三次交互才完成用户的认证，能不能给他缩短一下，在前端发送连接建立请求的时候，就附带token信息，进行一个握手认证？
+
+![image-20240104223539731](assets/image-20240104223539731.png)
