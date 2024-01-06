@@ -5830,3 +5830,1206 @@ public class UserController {
 ![image-20240105213127647](assets/image-20240105213127647.png)
 
 ![image-20240105213149411](assets/image-20240105213149411.png)
+
+
+
+## 登录拦截器
+
+### 创建拦截器
+
+继承`HandlerInterceptor`重写前置和后置方法。
+
+#### TokenInterceptor
+
+```java
+import com.luoying.luochat.common.common.exception.HttpErrorEnum;
+import com.luoying.luochat.common.user.service.LoginService;
+import org.springframework.stereotype.Component;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+import javax.annotation.Resource;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 10:25
+ */
+@Component
+public class TokenInterceptor implements HandlerInterceptor {
+
+    public static final String AUTHORIZATION_HEADER = "Authorization";
+    public static final String AUTHORIZATION_SCHEMA = "Bearer ";
+    public static final String UID = "uid";
+
+    @Resource
+    private LoginService loginService;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        String token = getToken(request);
+        Long validUid = loginService.getValidUid(token);
+        if (Objects.nonNull(validUid)) {// 用户有登录态
+            request.setAttribute(UID, validUid);
+        } else {// 用户未登录
+            boolean isPublic = isPublicURI(request);
+            if (!isPublic) {// 拦截非public权限的路径，因为未登录只能访问public权限的路径
+                HttpErrorEnum.ACCESS_DENIED.sendHttpError(response);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 判断路径是否为public权限
+     * @param request
+     * @return
+     */
+    private static boolean isPublicURI(HttpServletRequest request) {
+        String requestURI = request.getRequestURI();
+        String[] split = requestURI.split("/");
+        boolean isPublic = split.length > 3 && "public".equals(split[3]);
+        return isPublic;
+    }
+
+    /**
+     * 从Authorization请求头中，获取token
+     * @param request
+     * @return
+     */
+    private String getToken(HttpServletRequest request) {
+        String authorization = request.getHeader(AUTHORIZATION_HEADER);
+        return Optional.ofNullable(authorization)
+                .filter(header -> header.startsWith(AUTHORIZATION_SCHEMA))
+                .map(header -> header.replaceFirst(AUTHORIZATION_SCHEMA, ""))
+                .orElse(null);
+    }
+}
+```
+
+#### CollectorInterceptor
+
+```java
+import cn.hutool.extra.servlet.ServletUtil;
+import com.luoying.luochat.common.common.domain.dto.RequestInfo;
+import com.luoying.luochat.common.common.utils.RequestHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.util.Optional;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 12:41
+ */
+@Component
+public class CollectorInterceptor implements HandlerInterceptor {
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        // 从request的attribute中获取token
+        Long uid = Optional.ofNullable(request.getAttribute(TokenInterceptor.UID))
+                .map(Object::toString)
+                .map(Long::parseLong)
+                .get();
+        // 获取ip
+        String ip = ServletUtil.getClientIP(request);
+        // 封装
+        RequestInfo requestInfo = new RequestInfo();
+        requestInfo.setUid(uid);
+        requestInfo.setIp(ip);
+        // 存入ThreadLocal
+        RequestHolder.set(requestInfo);
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
+        // 使用完需要移除
+        RequestHolder.remove();
+    }
+}
+```
+
+![image-20240106131758633](assets/image-20240106131758633.png)
+
+
+
+### 编写配置类
+
+通过实现 WebMvcConfigurer 接口，并重写 addInterceptors() 方法来配置拦截器
+
+```java
+import com.luoying.luochat.common.common.interceptor.CollectorInterceptor;
+import com.luoying.luochat.common.common.interceptor.TokenInterceptor;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+import javax.annotation.Resource;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 12:10
+ */
+@Configuration
+public class InterceptorConfig implements WebMvcConfigurer {
+
+    @Resource
+    private TokenInterceptor tokenInterceptor;
+
+    @Resource
+    private CollectorInterceptor collectorInterceptor;
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {// 注意拦截器的添加顺序
+        registry.addInterceptor(tokenInterceptor)
+                .addPathPatterns("/capi/**");
+        registry.addInterceptor(collectorInterceptor)
+                .addPathPatterns("/capi/**");
+    }
+}
+```
+
+![image-20240106131950190](assets/image-20240106131950190.png)
+
+
+
+### 编写HttpErrorEnum
+
+主要是把返回`HttpError`的代码封装到`sendHttpError`，之后只需要像这样调用就行了
+
+```java
+HttpErrorEnum.ACCESS_DENIED.sendHttpError(reponse)
+```
+
+
+
+```java
+public interface ErrorEnum {
+
+    Integer getErrorCode();
+
+    String getErrorMsg();
+}
+```
+
+```java
+import cn.hutool.http.ContentType;
+import cn.hutool.json.JSONUtil;
+import com.luoying.luochat.common.common.domain.vo.resp.ApiResult;
+import lombok.AllArgsConstructor;
+
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+@AllArgsConstructor
+public enum HttpErrorEnum implements ErrorEnum {
+    ACCESS_DENIED(401, "登录失效，请重新登录"),
+    ;
+    private Integer httpCode;
+    private String msg;
+
+    @Override
+    public Integer getErrorCode() {
+        return httpCode;
+    }
+
+    @Override
+    public String getErrorMsg() {
+        return msg;
+    }
+
+    public void sendHttpError(HttpServletResponse response) throws IOException {
+        response.setStatus(this.getErrorCode());
+        response.setContentType(ContentType.JSON.toString(StandardCharsets.UTF_8));
+        ApiResult responseData = ApiResult.fail(this.getErrorCode(), this.getErrorMsg());
+        response.getWriter().write(JSONUtil.toJsonStr(responseData));
+    }
+}
+```
+
+![image-20240106132543296](assets/image-20240106132543296.png)
+
+
+
+### RequestHolder工具类
+
+```java
+import lombok.Data;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 12:53
+ */
+@Data
+public class RequestInfo {
+    private Long uid;
+
+    private String ip;
+}
+```
+
+```java
+import com.luoying.luochat.common.common.domain.dto.RequestInfo;
+
+/**
+ * description 请求上下文
+ *
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 12:47
+ */
+public class RequestHolder {
+    private static final ThreadLocal<RequestInfo> threadLocal = new ThreadLocal<>();
+
+    public static void set(RequestInfo requestInfo) {
+        threadLocal.set(requestInfo);
+    }
+
+    public static RequestInfo get() {
+        return threadLocal.get();
+    }
+
+    public static void remove() {
+        threadLocal.remove();
+    }
+}
+```
+
+![image-20240106133034973](assets/image-20240106133034973.png)
+
+
+
+### 修改UserController
+
+```java
+import com.luoying.luochat.common.common.domain.dto.RequestInfo;
+import com.luoying.luochat.common.common.domain.vo.resp.ApiResult;
+import com.luoying.luochat.common.common.interceptor.TokenInterceptor;
+import com.luoying.luochat.common.common.utils.RequestHolder;
+import com.luoying.luochat.common.user.domain.vo.resp.UserInfoResp;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import javax.servlet.http.HttpServletRequest;
+
+/**
+ * <p>
+ * 用户表 前端控制器
+ * </p>
+ *
+ * @author <a href="https://github.com/1ranxu">luoying</a>
+ * @since 2024-01-02
+ */
+@RestController
+@RequestMapping("/capi/user")
+@Api(tags = "用户相关接口")
+public class UserController {
+
+    @GetMapping("/userInfo")
+    @ApiOperation("获取用户个人信息")
+    public ApiResult<UserInfoResp> getUserInfo() {
+        // 使用RequestHolder从ThreadLocal中取出requestInfo
+        RequestInfo requestInfo = RequestHolder.get();
+        System.out.println(requestInfo.getUid());
+        return null;
+    }
+}
+```
+
+
+
+## 全局异常捕获
+
+### 开发用户接口
+
+#### 获取用户个人信息
+
+`UserController`
+
+```java
+@GetMapping("/userInfo")
+@ApiOperation("获取用户个人信息")
+public ApiResult<UserInfoResp> getUserInfo() {
+    return ApiResult.success(userService.getUserInfo(RequestHolder.get().getUid()));
+}
+```
+
+`UserServiceImpl`
+
+```java
+@Resource
+private UserBackpackDao userBackpackDao;
+
+@Override
+public UserInfoResp getUserInfo(Long uid) {
+    User user = userDao.getById(uid);
+    // 获取该用户未使用的改名卡个数
+    Integer modifyNameCount = userBackpackDao.getCountByItemId(uid, ItemEnum.MODIFY_NAME_CARD.getId());
+    return UserAdapter.buildUserInfoResp(user, modifyNameCount);
+}
+```
+
+`UserBackpackDao`
+
+```java
+public Integer getCountByItemId(Long uid, Long itemId) {
+    return lambdaQuery()
+            .eq(UserBackpack::getUid, uid)
+            .eq(UserBackpack::getItemId, itemId)
+            .eq(UserBackpack::getStatus, YesOrNoEnum.NO.getStatus())
+            .count();
+}
+```
+
+`UserAdapter`
+
+```java
+public static UserInfoResp buildUserInfoResp(User user, Integer modifyNameCount) {
+    UserInfoResp userInfoResp = new UserInfoResp();
+    BeanUtil.copyProperties(user, userInfoResp);
+    userInfoResp.setModifyNameChance(modifyNameCount);
+    return userInfoResp;
+}
+```
+
+补上物品表设计时未完成的枚举类
+
+```java
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+import java.util.Arrays;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * Description: 物品枚举
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 14:01
+ */
+@AllArgsConstructor
+@Getter
+public enum ItemEnum {
+    MODIFY_NAME_CARD(1L, ItemTypeEnum.MODIFY_NAME_CARD, "改名卡"),
+    LIKE_BADGE(2L, ItemTypeEnum.BADGE, "爆赞徽章"),
+    REG_TOP10_BADGE(3L, ItemTypeEnum.BADGE, "前十注册徽章"),
+    REG_TOP100_BADGE(4L, ItemTypeEnum.BADGE, "前100注册徽章"),
+    ;
+
+    private final Long id;
+    private final ItemTypeEnum typeEnum;
+    private final String desc;
+
+    private static Map<Long, ItemEnum> cache;
+
+    static {
+        cache = Arrays.stream(ItemEnum.values()).collect(Collectors.toMap(ItemEnum::getId, Function.identity()));
+    }
+
+    public static ItemEnum of(Long type) {
+        return cache.get(type);
+    }
+}
+```
+
+```java
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+import java.util.Arrays;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * Description: 物品枚举
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 14:01
+ */
+@AllArgsConstructor
+@Getter
+public enum ItemTypeEnum {
+    MODIFY_NAME_CARD(1, "改名卡"),
+    BADGE(2, "徽章"),
+    ;
+
+    private final Integer type;
+    private final String desc;
+
+    private static Map<Integer, ItemTypeEnum> cache;
+
+    static {
+        cache = Arrays.stream(ItemTypeEnum.values()).collect(Collectors.toMap(ItemTypeEnum::getType, Function.identity()));
+    }
+
+    public static ItemTypeEnum of(Integer type) {
+        return cache.get(type);
+    }
+}
+```
+
+![image-20240106161221110](assets/image-20240106161221110.png)
+
+这是用于查询改名卡是否使用的枚举类
+
+```java
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 14:12
+ */
+@AllArgsConstructor
+@Getter
+public enum YesOrNoEnum {
+    NO(0, "否"),
+    YES(1, "是");
+
+    private final Integer status;
+
+    private final String desc;
+}
+```
+
+![image-20240106161450092](assets/image-20240106161450092.png)
+
+
+
+#### 修改用户名
+
+我们使用了validation的一些注解，来帮助我们校验参数格式
+
+`UserController`
+
+```java
+@PutMapping("/name")
+@ApiOperation("修改用户名")
+public ApiResult<Void> modifyName(@Valid @RequestBody ModifyNameReq modifyNameReq) {
+    userService.modifyName(RequestHolder.get().getUid(), modifyNameReq.getName());
+    return ApiResult.success(null);
+}
+```
+
+`UserServiceImpl`
+
+```java
+@Override
+public void modifyName(Long uid, String name) {
+    // todo 之后自定义异常类和引入AssertUtil时，会完成这里的开发
+}
+```
+
+`ModifyNameReq`
+
+```java
+import io.swagger.annotations.ApiModelProperty;
+import lombok.Data;
+import org.hibernate.validator.constraints.Length;
+
+import javax.validation.constraints.NotBlank;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 14:56
+ */
+@Data
+public class ModifyNameReq {
+    @ApiModelProperty("用户名")
+    @NotBlank
+    @Length(max = 6, message = "用户名不可以超过六位")
+    private String name;
+}
+```
+
+![image-20240106162327636](assets/image-20240106162327636.png)
+
+因为我们使用了validation包的一些注解，来帮助我们校验参数格式，如果不满足格式会抛出`MethodArgumentNotValidException`异常
+
+，我们可以编写全局异常处理器来处理这些异常
+
+
+
+### 编写全局异常处理类
+
+```java
+import com.luoying.luochat.common.common.domain.vo.resp.ApiResult;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 15:14
+ */
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(value = MethodArgumentNotValidException.class)
+    public ApiResult<?> handleMethodArgumentNotValidException(MethodArgumentNotValidException exception) {
+        StringBuilder errorMsg = new StringBuilder();
+        // 从MethodArgumentNotValidException中获取所有FieldErrors
+        // 然后遍历获取field名称和具体出错信息，设置到errorMsg中
+        exception
+                .getBindingResult()
+                .getFieldErrors()
+                .forEach(x -> errorMsg
+                        .append(x.getField())
+                        .append(x.getDefaultMessage())
+                        .append(",")
+                );
+        String msg = errorMsg.substring(0,errorMsg.length()-1);
+        // 返回给前端
+        return ApiResult.fail(CommonErrorEnum.PARAM_INVALID.getCode(), msg);
+    }
+
+    @ExceptionHandler(value = Throwable.class)
+    public ApiResult<?> handleThrowable(Throwable throwable) {
+        log.error("System Exception! The reason is: {}",throwable.getMessage(),throwable);
+        return ApiResult.fail(CommonErrorEnum.SYSTEM_ERROR);
+    }
+}
+```
+
+为了方便设置失败的code，创建了`CommonErrorEnum`
+
+```java
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 15:32
+ */
+@AllArgsConstructor
+@Getter
+public enum CommonErrorEnum implements ErrorEnum{
+    SYSTEM_ERROR(-1,"系统出小差了，请稍后再尝试哦~~"),
+    PARAM_INVALID(-2, "参数校验失败");
+
+    private final Integer code;
+
+    private final String desc;
+
+    @Override
+    public Integer getErrorCode() {
+        return code;
+    }
+
+    @Override
+    public String getErrorMsg() {
+        return desc;
+    }
+}
+```
+
+![image-20240106162814934](assets/image-20240106162814934.png)
+
+同时我们为了更方便，让fail可以只传入`ErrorEnum`的子类，就可以返回给前端，于是在`ApiResult`中重载了fail方法
+
+```java
+public static <T> ApiResult<T> fail(ErrorEnum errorEnum) {
+    ApiResult<T> result = new ApiResult<T>();
+    result.setSuccess(Boolean.FALSE);
+    result.setErrCode(errorEnum.getErrorCode());
+    result.setErrMsg(errorEnum.getErrorMsg());
+    return result;
+}
+```
+
+
+
+## 自定义业务异常
+
+`BusinessException`
+
+```java
+import lombok.Data;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 16:41
+ */
+@Data
+public class BusinessException extends RuntimeException {
+    protected Integer errorCode;
+
+    protected String errorMsg;
+
+    public BusinessException(String errorMsg) {
+        super(errorMsg);
+        this.errorCode=CommonErrorEnum.BUSINESS_ERROR.getErrorCode();
+        this.errorMsg = errorMsg;
+    }
+
+    public BusinessException(Integer errorCode, String errorMsg) {
+        super(errorMsg);
+        this.errorCode = errorCode;
+        this.errorMsg = errorMsg;
+    }
+
+}
+```
+
+`CommonErrorEnum`
+
+```java
+BUSINESS_ERROR(0,"{}"),
+```
+
+`GlobalExceptionHandler`
+
+```java
+/**
+ * 业务异常处理
+ */
+@ExceptionHandler(value = BusinessException.class)
+public ApiResult<?> handleBusinessException(BusinessException e) {
+    log.info("Business Exception! The reason is: {}",e.getMessage());
+    return ApiResult.fail(e.getErrorCode(),e.getErrorMsg());
+}
+```
+
+`UserServiceImpl`
+
+```java
+@Override
+public void modifyName(Long uid, String name) {
+    User user = userDao.getByName(name);
+    if (Objects.nonNull(user)){
+        throw new BusinessException("名字重复，换个名字再尝试吧~~");
+    }
+}
+```
+
+`UserDao`
+
+```java
+public User getByName(String name) {
+    return lambdaQuery().eq(User::getName, name).one();
+}
+```
+
+
+
+## 业务校验工具类AssertUtil
+
+```java
+import cn.hutool.core.util.ObjectUtil;
+import com.luoying.luochat.common.common.exception.BusinessException;
+import com.luoying.luochat.common.common.exception.CommonErrorEnum;
+import com.luoying.luochat.common.common.exception.ErrorEnum;
+import org.hibernate.validator.HibernateValidator;
+
+import javax.validation.ConstraintViolation;
+import javax.validation.Validation;
+import javax.validation.Validator;
+import java.text.MessageFormat;
+import java.util.*;
+
+/**
+ * 校验工具类
+ */
+public class AssertUtil {
+
+    /**
+     * 校验到失败就结束
+     */
+    private static Validator failFastValidator = Validation.byProvider(HibernateValidator.class)
+            .configure()
+            .failFast(true)
+            .buildValidatorFactory().getValidator();
+
+    /**
+     * 全部校验
+     */
+    private static Validator validator = Validation.buildDefaultValidatorFactory().getValidator();
+
+    /**
+     * 注解验证参数(校验到失败就结束)
+     *
+     * @param obj
+     */
+    public static <T> void fastFailValidate(T obj) {
+        Set<ConstraintViolation<T>> constraintViolations = failFastValidator.validate(obj);
+        if (constraintViolations.size() > 0) {
+            throwException(CommonErrorEnum.PARAM_INVALID, constraintViolations.iterator().next().getMessage());
+        }
+    }
+
+    /**
+     * 注解验证参数(全部校验,抛出异常)
+     *
+     * @param obj
+     */
+    public static <T> void allCheckValidateThrow(T obj) {
+        Set<ConstraintViolation<T>> constraintViolations = validator.validate(obj);
+        if (constraintViolations.size() > 0) {
+            StringBuilder errorMsg = new StringBuilder();
+            Iterator<ConstraintViolation<T>> iterator = constraintViolations.iterator();
+            while (iterator.hasNext()) {
+                ConstraintViolation<T> violation = iterator.next();
+                //拼接异常信息
+                errorMsg.append(violation.getPropertyPath().toString()).append(":").append(violation.getMessage()).append(",");
+            }
+            //去掉最后一个逗号
+            throwException(CommonErrorEnum.PARAM_INVALID, errorMsg.toString().substring(0, errorMsg.length() - 1));
+        }
+    }
+
+
+    /**
+     * 注解验证参数(全部校验,返回异常信息集合)
+     *
+     * @param obj
+     */
+    public static <T> Map<String, String> allCheckValidate(T obj) {
+        Set<ConstraintViolation<T>> constraintViolations = validator.validate(obj);
+        if (constraintViolations.size() > 0) {
+            Map<String, String> errorMessages = new HashMap<>();
+            Iterator<ConstraintViolation<T>> iterator = constraintViolations.iterator();
+            while (iterator.hasNext()) {
+                ConstraintViolation<T> violation = iterator.next();
+                errorMessages.put(violation.getPropertyPath().toString(), violation.getMessage());
+            }
+            return errorMessages;
+        }
+        return new HashMap<>();
+    }
+
+    //如果不是true，则抛异常
+    public static void isTrue(boolean expression, String msg) {
+        if (!expression) {
+            throwException(msg);
+        }
+    }
+
+    public static void isTrue(boolean expression, ErrorEnum errorEnum, Object... args) {
+        if (!expression) {
+            throwException(errorEnum, args);
+        }
+    }
+
+    //如果是true，则抛异常
+    public static void isFalse(boolean expression, String msg) {
+        if (expression) {
+            throwException(msg);
+        }
+    }
+
+    //如果是true，则抛异常
+    public static void isFalse(boolean expression, ErrorEnum errorEnum, Object... args) {
+        if (expression) {
+            throwException(errorEnum, args);
+        }
+    }
+
+    //如果不是非空对象，则抛异常
+    public static void isNotEmpty(Object obj, String msg) {
+        if (isEmpty(obj)) {
+            throwException(msg);
+        }
+    }
+
+    //如果不是非空对象，则抛异常
+    public static void isNotEmpty(Object obj, ErrorEnum errorEnum, Object... args) {
+        if (isEmpty(obj)) {
+            throwException(errorEnum, args);
+        }
+    }
+
+    //如果不是非空对象，则抛异常
+    public static void isEmpty(Object obj, String msg) {
+        if (!isEmpty(obj)) {
+            throwException(msg);
+        }
+    }
+
+    public static void equal(Object o1, Object o2, String msg) {
+        if (!ObjectUtil.equal(o1, o2)) {
+            throwException(msg);
+        }
+    }
+
+    public static void notEqual(Object o1, Object o2, String msg) {
+        if (ObjectUtil.equal(o1, o2)) {
+            throwException(msg);
+        }
+    }
+
+    private static boolean isEmpty(Object obj) {
+        return ObjectUtil.isEmpty(obj);
+    }
+
+    private static void throwException(String msg) {
+        throwException(null, msg);
+    }
+
+    private static void throwException(ErrorEnum errorEnum, Object... arg) {
+        if (Objects.isNull(errorEnum)) {
+            errorEnum = CommonErrorEnum.BUSINESS_ERROR;
+        }
+        throw new BusinessException(errorEnum.getErrorCode(), MessageFormat.format(errorEnum.getErrorMsg(), arg));
+    }
+
+
+}
+```
+
+
+
+`UserServiceImpl`
+
+```java
+@Override
+@Transactional(rollbackFor = Exception.class)
+public void modifyName(Long uid, String name) {
+    User user = userDao.getByName(name);
+    // 使用AssertUtil的isEmpty方法判断user是否为空，不为空就会抛出BusinessException
+    // errorMsg就是isEmpty方法的第二个参数
+    AssertUtil.isEmpty(user,"名字重复，换个名字再尝试吧~~");
+    // 获取该用户第一个可用的改名卡，然后使用掉
+    UserBackpack modifyNameItem = userBackpackDao.getFirstValidItem(uid, ItemEnum.MODIFY_NAME_CARD.getId());
+    AssertUtil.isNotEmpty(modifyNameItem,"无可用改名卡哦");
+    // 使用改名卡
+    boolean success = userBackpackDao.useItem(modifyNameItem);
+    if (success){ // 改名
+        userDao.modifyName(uid,name);
+    }
+}
+```
+
+`UserBackpackDao`
+
+```java
+public UserBackpack getFirstValidItem(Long uid, Long itemId) {
+    return lambdaQuery()
+            .eq(UserBackpack::getUid, uid)
+            .eq(UserBackpack::getItemId, itemId)
+            .eq(UserBackpack::getStatus, YesOrNoEnum.NO.getStatus())
+            .orderByAsc(UserBackpack::getId)
+            .last("limit 1")
+            .one();
+}
+public boolean useItem(UserBackpack modifyNameItem) {
+    return lambdaUpdate()
+            .eq(UserBackpack::getUid, modifyNameItem.getUid())
+            .eq(UserBackpack::getItemId, modifyNameItem.getItemId())
+            .eq(UserBackpack::getStatus, YesOrNoEnum.NO.getStatus())
+            .set(UserBackpack::getStatus, YesOrNoEnum.YES)
+            .update();
+}
+```
+
+`UserDao`
+
+```java
+public void modifyName(Long uid, String name) {
+    lambdaUpdate().eq(User::getId, uid).set(User::getName, name).update();
+}
+```
+
+
+
+
+
+## 整合Spring缓存Cacheable
+
+### 编写配置类
+
+这段代码是Java Spring框架的一部分，用于配置缓存。它使用了Caffeine库作为缓存提供者，并使用Spring的缓存注解进行配置。
+
+具体来说：
+
+1. `@EnableCaching`注解表示启用Spring的缓存功能。
+2. `@Configuration`注解表示这是一个配置类，用于定义和配置应用程序中的bean。
+3. `public class CacheConfig extends CachingConfigurerSupport`表示这是一个继承自`CachingConfigurerSupport`的配置类，用于自定义缓存配置。
+4. `@Bean("caffeineCacheManager")`注解表示创建一个名为"caffeineCacheManager"的bean。
+5. `@Primary`注解表示这个bean是主要的，当有多个相同类型的bean时，Spring会优先选择这个bean。
+6. `caffeineCacheManager()`方法返回一个`CacheManager`对象，这里创建了一个`CaffeineCacheManager`对象，并设置了Caffeine缓存的相关参数，如过期时间、初始容量和最大容量。
+7. `cacheManager.setCaffeine(Caffeine.newBuilder()...)`方法用于设置Caffeine缓存的相关参数。
+
+总之，这段代码的作用是配置一个使用Caffeine作为缓存提供者的Spring应用程序，并设置了缓存的过期时间、初始容量和最大容量。
+
+```java
+import com.github.benmanes.caffeine.cache.Caffeine;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.CachingConfigurerSupport;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.caffeine.CaffeineCacheManager;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+import java.util.concurrent.TimeUnit;
+
+@EnableCaching
+@Configuration
+public class CacheConfig extends CachingConfigurerSupport {
+
+    @Bean("caffeineCacheManager")
+    @Primary
+    public CacheManager caffeineCacheManager() {
+        CaffeineCacheManager cacheManager = new CaffeineCacheManager();
+        // 方案一(常用)：定制化缓存Cache
+        cacheManager.setCaffeine(Caffeine.newBuilder()
+                .expireAfterWrite(5, TimeUnit.MINUTES)
+                .initialCapacity(100)
+                .maximumSize(200));
+        return cacheManager;
+    }
+}
+```
+
+![image-20240106210629287](assets/image-20240106210629287.png)
+
+### 编写ItemCache
+
+使用Spring框架的注解和依赖注入来实现对数据库中的数据进行缓存和清除缓存的操作。
+
+- `getByType(Integer itemType)`：该方法用于根据给定的物品类型（itemType）从缓存中获取对应的物品配置列表。如果缓存中没有对应的数据，则会调用`itemConfigDao.getByType(itemTYpe)`从数据库中查询数据，并将结果存入缓存中。
+- `evictByType(Integer itemTYpe)`：该方法用于清除缓存中与给定项目类型相关的数据。当需要更新或删除某个项目类型的数据时，可以调用此方法来清除缓存中的旧数据。
+- 使用`@Cacheable`和`@CacheEvict`注解来定义缓存的行为。`@Cacheable`注解用于指定哪些方法的结果应该被缓存，而`@CacheEvict`注解用于指定哪些方法会清除缓存中的数据。
+
+```java
+import com.luoying.luochat.common.user.dao.ItemConfigDao;
+import com.luoying.luochat.common.user.domain.entity.ItemConfig;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+import java.util.List;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 19:35
+ */
+@Component
+public class ItemCache {
+    @Resource
+    private ItemConfigDao itemConfigDao;
+
+    @Cacheable(cacheNames = "item", key = "'itemsByType:'+#itemTYpe")
+    public List<ItemConfig> getByType(Integer itemTYpe) {
+        return itemConfigDao.getByType(itemTYpe);
+    }
+
+    @CacheEvict(cacheNames = "item", key = "'itemsByType:'+#itemTYpe")
+    public void evictByType(Integer itemTYpe) {
+    }
+}
+```
+
+![image-20240106212540324](assets/image-20240106212540324.png)
+
+`ItemConfigDao`
+
+```java
+public List<ItemConfig> getByType(Integer itemType) {
+    return lambdaQuery().eq(ItemConfig::getType, itemType).list();
+}
+```
+
+
+
+### 开发用户接口
+
+#### 可选徽章预览
+
+`UserController`
+
+```java
+@GetMapping("/badges")
+@ApiOperation("可选徽章预览")
+public ApiResult<List<BadgeResp>> badges() {
+    return ApiResult.success(userService.badges(RequestHolder.get().getUid()));
+}
+```
+
+`UserServiceImpl`
+
+```java
+@Resource
+private UserBackpackDao userBackpackDao;
+@Resource
+private ItemCache itemCache;
+
+@Override
+public List<BadgeResp> badges(Long uid) {
+    // 查询所有徽章
+    List<ItemConfig> itemConfigs = itemCache.getByType(ItemTypeEnum.BADGE.getType());
+    // 查询用户拥有的徽章
+    List<Long> itemIds = itemConfigs.stream().map(ItemConfig::getId).collect(Collectors.toList());
+    List<UserBackpack> backpacks = userBackpackDao.getByItemIds(uid, itemIds);
+    // 查询用户佩戴的徽章
+    User user = userDao.getById(uid);
+    return UserAdapter.buildBadgesResp(itemConfigs, backpacks, user.getItemId());
+}
+```
+
+`UserBackpackDao`
+
+```java
+public List<UserBackpack> getByItemIds(Long uid, List<Long> itemIds) {
+    return lambdaQuery()
+            .eq(UserBackpack::getUid, uid)
+            .eq(UserBackpack::getStatus,YesOrNoEnum.NO.getStatus())
+            .in(UserBackpack::getItemId, itemIds)
+            .list();
+}
+```
+
+`UserAdapter`
+
+```java
+public static List<BadgeResp> buildBadgesResp(List<ItemConfig> itemConfigs, List<UserBackpack> backpacks, Long itemId) {
+    Set<Long> obtainItemSet = backpacks.stream().map(UserBackpack::getItemId).collect(Collectors.toSet());
+    return itemConfigs.stream().map(itemConfig -> {
+        BadgeResp badgeResp = new BadgeResp();
+        BeanUtil.copyProperties(itemConfig, badgeResp);
+        badgeResp.setObtain(obtainItemSet.contains(badgeResp.getId()) ? YesOrNoEnum.YES.getStatus() : YesOrNoEnum.NO.getStatus());
+        badgeResp.setWearing(Objects.equals(badgeResp.getId(), itemId) ? YesOrNoEnum.YES.getStatus() : YesOrNoEnum.NO.getStatus());
+        return badgeResp;
+    }).sorted(
+            Comparator
+             // 先根据是否拥有排序，0否1是，会把未拥有的排到前面，所以需要反转一下顺序       
+            .comparing(BadgeResp::getObtain,Comparator.reverseOrder())
+             // 再根据是否佩戴排序，0否1是，会把未佩戴的排到前面，所以需要反转一下顺序       
+            .thenComparing(BadgeResp::getWearing,Comparator.reverseOrder())
+    ).collect(Collectors.toList());
+}
+```
+
+`BadgeResp`
+
+```java
+import io.swagger.annotations.ApiModel;
+import io.swagger.annotations.ApiModelProperty;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 20:10
+ */
+@Data
+@EqualsAndHashCode(callSuper = false)
+@ApiModel(value="用户信息响应对象", description="用户信息")
+public class BadgeResp {
+    @ApiModelProperty(value = "徽章id")
+    private Long id;
+    @ApiModelProperty(value = "徽章图标")
+    private String img;
+    @ApiModelProperty(value = "徽章描述")
+    private String describe;
+    @ApiModelProperty(value = "是否拥有 0-否 1-是")
+    private Integer obtain;
+    @ApiModelProperty(value = "是否佩戴 0-否 1-是")
+    private Integer wearing;
+}
+```
+
+![image-20240106213708458](assets/image-20240106213708458.png)
+
+
+
+#### 佩戴徽章
+
+`UserController`
+
+```java
+@PutMapping("/wearBadge")
+@ApiOperation("佩戴徽章")
+public ApiResult<Void> wearBage(@Valid @RequestBody WearBadgeReq wearBadgeReq) {
+    return ApiResult.success(userService.wearBage(RequestHolder.get().getUid(),wearBadgeReq.getItemId()));
+}
+```
+
+`WearBadgeReq`
+
+```java
+import io.swagger.annotations.ApiModelProperty;
+import lombok.Data;
+
+import javax.validation.constraints.NotNull;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 20:56
+ */
+@Data
+public class WearBadgeReq {
+    @ApiModelProperty("徽章id")
+    @NotNull
+    private Long itemId;
+}
+```
+
+![image-20240106212211928](assets/image-20240106212211928.png)
+
+`UserServiceImpl`
+
+```java
+@Resource
+private UserDao userDao;
+@Resource
+private UserBackpackDao userBackpackDao
+@Resource
+private ItemConfigDao itemConfigDao;
+
+@Override
+public Void wearBage(Long uid, Long itemId) {
+    // 确保拥有徽章
+    UserBackpack validItem = userBackpackDao.getFirstValidItem(uid, itemId);
+    AssertUtil.isNotEmpty(validItem, "暂未获得该徽章哦~~");
+    // 确保这个物品是徽章
+    ItemConfig itemConfig = itemConfigDao.getById(itemId);
+    AssertUtil.equal(itemConfig.getType(), ItemTypeEnum.BADGE.getType(), "只有徽章才能佩戴，不要尝试佩戴奇怪的东西哦~~");
+    // 佩戴徽章
+    userDao.wearBadge(uid, itemId);
+    return null;
+}
+```
+
+`UserDao`
+
+```java
+public void wearBadge(Long uid, Long itemId) {
+    lambdaUpdate().eq(User::getId,uid)
+            .set(User::getItemId,itemId)
+            .update();
+}
+```
+
+
+
+### 踩坑
+
+`ItemConfig`
+
+```java
+/**
+ * 物品功能描述
+ */
+@TableField("'describe'")
+private String describe;
+```
+
+describe是MySQL的关键字，用单引号括起来一下，遇到这种错误建议把报错信息给AI看看，人很难看出来
+
+在关系型数据库中，表的字段名可以由字母、数字和特殊字符组成，但有些字符是保留字或具有特殊含义的，例如"describe"就是一个保留字。为了确保字段名能够正确地被识别和引用，我们通常会将字段名用单引号括起来，以将其与保留字或其他特殊字符区分开来。
+
+因此，在这个例子中，`@TableField("'describe'")`注解中的单引号是为了告诉数据库系统，该字段名为"describe"，而不是其他可能与其冲突的保留字或关键字。
