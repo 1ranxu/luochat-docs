@@ -7305,7 +7305,7 @@ public void acquireItem(Long uid, Long itemId, IdempotentEnum idempotentEnum, St
 
 ### 注解式
 
-#### 创建注解`@RedissonLock`
+#### 创建注解@RedissonLock
 
 ```java
 package com.luoying.luochat.common.common.annotation;
@@ -7482,5 +7482,140 @@ public void modifyName(Long uid, String name) {
     if (success) { // 改名
         userDao.modifyName(uid, name);
     }
+}
+```
+
+
+
+
+
+## SpringEvent-观察者模式
+
+### 发送事件
+
+`UserServiceImpl`
+
+```java
+import org.springframework.context.ApplicationEventPublisher;
+
+@Resource
+private ApplicationEventPublisher applicationEventPublisher;
+
+@Override
+@Transactional
+public Long register(User user) {
+    userDao.save(user);
+    // 用户注册的事件
+    applicationEventPublisher.publishEvent(new UserRegisterEvent(this,user));
+    return user.getId();
+}
+```
+
+```java
+package com.luoying.luochat.common.common.event;
+
+import com.luoying.luochat.common.user.domain.entity.User;
+import lombok.Getter;
+import org.springframework.context.ApplicationEvent;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 20:58
+ */
+@Getter
+public class UserRegisterEvent extends ApplicationEvent {
+    private User user;
+
+    public UserRegisterEvent(Object source, User user) {// source就是事件发送者
+        super(source);
+        this.user = user;
+    }
+}
+
+```
+
+### 订阅事件
+
+```java
+package com.luoying.luochat.common.common.event.listener;
+
+import com.luoying.luochat.common.common.event.UserRegisterEvent;
+import com.luoying.luochat.common.user.dao.UserDao;
+import com.luoying.luochat.common.user.domain.entity.User;
+import com.luoying.luochat.common.user.domain.enums.IdempotentEnum;
+import com.luoying.luochat.common.user.domain.enums.ItemEnum;
+import com.luoying.luochat.common.user.service.UserBackpackService;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+import javax.annotation.Resource;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 21:02
+ */
+@Component
+public class UserRegisterListener {
+    @Resource
+    private UserBackpackService userBackpackService;
+
+    @Resource
+    private UserDao userDao;
+
+    @TransactionalEventListener(classes = UserRegisterEvent.class, phase = TransactionPhase.AFTER_COMMIT)
+    public void sendModifyNameCard(UserRegisterEvent event) {
+        User user = event.getUser();
+        userBackpackService.acquireItem(user.getId(), ItemEnum.MODIFY_NAME_CARD.getId(), IdempotentEnum.UID, user.getId() + "");
+    }
+
+    @TransactionalEventListener(classes = UserRegisterEvent.class, phase = TransactionPhase.AFTER_COMMIT)
+    public void sendBadege(UserRegisterEvent event) {
+        User user = event.getUser();
+        int registeredCount = userDao.count();
+        if (registeredCount < 10)
+            userBackpackService.acquireItem(user.getId(), ItemEnum.REG_TOP10_BADGE.getId(), IdempotentEnum.UID, user.getId() + "");
+        else if (registeredCount < 100) {
+            userBackpackService.acquireItem(user.getId(), ItemEnum.REG_TOP100_BADGE.getId(), IdempotentEnum.UID, user.getId() + "");
+        }
+    }
+
+}
+```
+
+
+
+### 完善物品发放接口
+
+`UserBackpackServiceImpl`
+
+```java
+@Resource
+@Lazy
+private UserBackpackServiceImpl userBackpackService;
+
+@Override
+public void acquireItem(Long uid, Long itemId, IdempotentEnum idempotentEnum, String businessId) {
+    // 组装幂等号
+    String idempotent = getIdempotent(itemId, idempotentEnum, businessId);
+    userBackpackService.doAcquireItem(uid, itemId, idempotent);
+}
+
+@Transactional
+@RedissonLock(key = "#idempotent",waitTime = 5000)
+public void doAcquireItem(Long uid, Long itemId, String idempotent) {
+    // 幂等判断
+    UserBackpack userBackpack = userBackpackDao.getbyIdempotent(idempotent);
+    if (Objects.nonNull(userBackpack)) {
+        return;
+    }
+    // todo 业务检查
+    // 发放物品
+    UserBackpack insert = UserBackpack.builder()
+            .uid(uid)
+            .itemId(itemId)
+            .status(YesOrNoEnum.NO.getStatus())
+            .idempotent(idempotent).build();
+    userBackpackDao.save(insert);
 }
 ```
