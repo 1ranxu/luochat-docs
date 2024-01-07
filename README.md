@@ -6905,10 +6905,10 @@ public static List<BadgeResp> buildBadgesResp(List<ItemConfig> itemConfigs, List
         return badgeResp;
     }).sorted(
             Comparator
-             // 先根据是否拥有排序，0否1是，会把未拥有的排到前面，所以需要反转一下顺序       
-            .comparing(BadgeResp::getObtain,Comparator.reverseOrder())
-             // 再根据是否佩戴排序，0否1是，会把未佩戴的排到前面，所以需要反转一下顺序       
-            .thenComparing(BadgeResp::getWearing,Comparator.reverseOrder())
+             // 先根据是否佩戴排序，让佩戴的展示在最前面，0否1是，会把未佩戴的排到前面，所以需要反转一下顺序
+            .comparing(BadgeResp::getWearing,Comparator.reverseOrder())
+             // 再根据是否拥有排序，0否1是，会把未拥有的排到前面，所以需要反转一下顺序
+            .thenComparing(BadgeResp::getObtain,Comparator.reverseOrder())
     ).collect(Collectors.toList());
 }
 ```
@@ -7033,3 +7033,454 @@ describe是MySQL的关键字，用单引号括起来一下，遇到这种错误�
 在关系型数据库中，表的字段名可以由字母、数字和特殊字符组成，但有些字符是保留字或具有特殊含义的，例如"describe"就是一个保留字。为了确保字段名能够正确地被识别和引用，我们通常会将字段名用单引号括起来，以将其与保留字或其他特殊字符区分开来。
 
 因此，在这个例子中，`@TableField("'describe'")`注解中的单引号是为了告诉数据库系统，该字段名为"describe"，而不是其他可能与其冲突的保留字或关键字。
+
+
+
+## 物品发放幂等设计
+
+一个用户可能拥有多个相同的物品，比如改名卡。如何确保给用户发很多次，最终奖励不会多发？
+
+以改名卡举例，用户可以通过`购买`、`注册`、`消息被点赞`等渠道获取改名卡。这么多渠道都能发放改名卡，在分布式场景下，交互不在一个事务内，是**不可靠**的。不可靠就一定会需要**重试**，重试如果没保证**幂等**就有可能**超发**。
+
+如何保证重复的情况下不超发，幂等如何去设计，其实是一个很严肃的问题，需要开发和产品共同去讨论业务的边界，什么情况算重复。
+
+对于改名卡，我们可以这么去思考他的幂等边界。
+
+`购买渠道`：同一个订单号最多只能发一次。
+
+`注册渠道`：同一个uid只能发一次。
+
+`消息点赞渠道`：同一条被点赞的消息最多发一次。
+
+有了这些幂等标识，用来做数据库的唯一键，就可以保证不会多发了。
+
+![image-20240107131259475](assets/image-20240107131259475.png)
+
+这个幂等键的设置就比较明确了，针对某个物品，在某个渠道下的具体发放标识，不能重复。
+
+幂等号=`itemId`+`source`+`businessId`
+
+### 幂等判断
+
+`UserBackpackService`
+
+```java
+import com.luoying.luochat.common.user.domain.enums.IdempotentEnum;
+
+/**
+ * <p>
+ * 用户背包表 服务类
+ * </p>
+ *
+ * @author <a href="https://github.com/1ranxu">luoying</a>
+ * @since 2024-01-05
+ */
+public interface UserBackpackService {
+
+    /**
+     * 给用户发放一个物品
+     *
+     * @param uid            用户id
+     * @param itemId         物品id
+     * @param idempotentEnum 幂等类型
+     * @param businessId     业务唯一标识
+     */
+    void acquireItem(Long uid, Long itemId, IdempotentEnum idempotentEnum, String businessId);
+
+}
+```
+
+发放物品作为一个底层功能，我们给他专门写了个方法。给对应的`用户`，发放某个`物品`，标识`幂等类型`，以及唯一`业务标识`。
+
+为啥需要幂等类型？如果只用业务标识的话，`uid`和`msgId`是有可能重复的，根据渠道做一个更严格的隔离。
+
+幂等类型目前只有uid和消息id。
+
+`IdempotentEnum`
+
+```java
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 12:10
+ */
+@AllArgsConstructor
+@Getter
+public enum IdempotentEnum {
+
+    UID(1,"uid"),
+    MSG_ID(2,"消息id");
+
+
+    private final Integer type;
+
+    private final String desc;
+}
+```
+
+![image-20240107135242105](assets/image-20240107135242105.png)
+
+`UserBackpackServiceImpl`
+
+```java
+@Resource
+private RedissonClient redissonClient;
+@Resource
+private UserBackpackDao userBackpackDao;
+@Override
+public void acquireItem(Long uid, Long itemId, IdempotentEnum idempotentEnum, String businessId) {
+    // 组装幂等号
+    String idempotent = getIdempotent(itemId, idempotentEnum, businessId);
+    // 加锁
+    RLock lock = redissonClient.getLock("acquireItem_" + idempotent);
+    boolean b = lock.tryLock();
+    AssertUtil.isTrue(b, "请求太频繁了");
+    try {
+        // 幂等判断
+        UserBackpack userBackpack = userBackpackDao.getbyIdempotent(idempotent);
+        if (Objects.nonNull(userBackpack)) {
+            return;
+        }
+        // todo 业务检查
+        // 发放物品
+        UserBackpack insert = UserBackpack.builder()
+                .uid(uid)
+                .itemId(itemId)
+                .status(YesOrNoEnum.NO.getStatus())
+                .idempotent(idempotent).build();
+        userBackpackDao.save(insert);
+    } finally {
+        lock.unlock();
+    }
+}
+/**
+ * 组装幂等号
+ *
+ * @param itemId         物品id
+ * @param idempotentEnum 幂等类型
+ * @param businessId     业务唯一标识
+ * @return
+ */
+private String getIdempotent(Long itemId, IdempotentEnum idempotentEnum, String businessId) {
+    return String.format("%d_%d_%s", itemId, idempotentEnum.getType(), businessId);
+}
+```
+
+这里用到分布式锁，根据用户来做资源的隔离，确保你在一个串行的环境下，判断幂等是否重复。
+
+幂等判断的三件套：
+
+1. 组装幂等号
+2. 加锁，[分布式锁注解](https://www.yuque.com/snab/mallchat/ufszw5q0idpfuwia)
+3. 重复校验
+
+
+
+`UserBackpackDao`
+
+```java
+public UserBackpack getbyIdempotent(String idempotent) {
+    return lambdaQuery()
+            .eq(UserBackpack::getIdempotent, idempotent)
+            .one();
+}
+```
+
+
+
+
+
+## 分布式锁工具类
+
+### 编程式
+
+我们可以抽出一个`LockService`方法，把锁的模板写在`executeWithLock`方法里，调用的时候只需要指定`key`、`waitTime`、`timeUnit`，把锁内的代码块用`Supplier`函数传进来
+
+`Supplier`是一个函数式接口，使用`Supplier`接口，需要实现它的`get()`方法。这个方法不接受任何参数，但需要返回一个结果。可以使用Lambda表达式或者方法引用来实现这个接口。
+
+如果我们不需要排队等锁，甚至还能重载方法减少两个参数。
+
+`LockServcie`
+
+```java
+package com.luoying.luochat.common.common.service;
+
+import com.luoying.luochat.common.common.exception.BusinessException;
+import com.luoying.luochat.common.common.exception.CommonErrorEnum;
+import lombok.SneakyThrows;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.Resource;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 13:53
+ */
+@Service
+public class LockServcie {
+    @Resource
+    private RedissonClient redissonClient;
+
+    @SneakyThrows
+    public <T> T executeWithLock(String key, int waitTime, TimeUnit timeUnit, Supplier<T> supplier) {
+        RLock lock = redissonClient.getLock(key);
+        boolean success = lock.tryLock(waitTime, timeUnit);
+        if (!success) {
+            throw new BusinessException(CommonErrorEnum.LOCK_LIMIT);
+        }
+        try {
+            return supplier.get();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @SneakyThrows
+    public <T> T executeWithLock(String key, Supplier<T> supplier) {
+        return executeWithLock(key, -1, TimeUnit.MICROSECONDS, supplier);
+    }
+
+    @SneakyThrows
+    public <T> T executeWithLock(String key, Runnable runnable) {
+        return executeWithLock(key, -1, TimeUnit.MICROSECONDS, () -> {
+            runnable.run();
+            return null;
+        });
+    }
+}
+```
+
+`BusinessException`
+
+```java
+public BusinessException(ErrorEnum errorEnum) {
+    super(errorEnum.getErrorMsg());
+    this.errorCode = errorEnum.getErrorCode();
+    this.errorMsg = errorEnum.getErrorMsg();
+}
+```
+
+`CommonErrorEnum`
+
+```java
+LOCK_LIMIT(-3, "请求太频繁了，请稍后再尝试哦~~");
+```
+
+`UserBackpackServiceImpl`
+
+```java
+@Resource
+private LockServcie lockServcie;
+
+@Override
+public void acquireItem(Long uid, Long itemId, IdempotentEnum idempotentEnum, String businessId) {
+    // 组装幂等号
+    String idempotent = getIdempotent(itemId, idempotentEnum, businessId);
+    // 加锁
+    lockServcie.executeWithLock("acquireItem_" + idempotent, () -> {// lockServcied的第三个重载方法
+        // 幂等判断
+        UserBackpack userBackpack = userBackpackDao.getbyIdempotent(idempotent);
+        if (Objects.nonNull(userBackpack)) {
+            return;
+        }
+        // todo 业务检查
+        // 发放物品
+        UserBackpack insert = UserBackpack.builder()
+                .uid(uid)
+                .itemId(itemId)
+                .status(YesOrNoEnum.NO.getStatus())
+                .idempotent(idempotent).build();
+        userBackpackDao.save(insert);
+    });
+}
+```
+
+
+
+### 注解式
+
+#### 创建注解`@RedissonLock`
+
+```java
+package com.luoying.luochat.common.common.annotation;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * description：分布式注解
+ *
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 17:35
+ */
+@Retention(RetentionPolicy.RUNTIME)// 运行时生效
+@Target({ElementType.METHOD}) // 作用在方法上
+public @interface RedissonLock {
+
+    /**
+     * key的前缀,取方法的全限定名，例如：class java.lang.String.toUpperCase
+     * 除非我们需要在不同方法对同一个资源做分布式锁，就可以自己指定
+     */
+    String prefix() default "";
+
+    /**
+     * 支持SpringEL表达式的key
+     */
+    String key();
+
+    /**
+     * 重试等待时间，默认重试快速失败
+     */
+    int waitTime() default -1;
+
+    /**
+     * 时间单位，默认毫秒
+     */
+    TimeUnit timeUnit() default TimeUnit.MILLISECONDS;
+}
+
+```
+
+约定大于配置的思想，我们的大多数参数都是可以默认的。
+
+很多时候我们的锁都是针对方法的，如果只有一个方法需要对某种资源做分布式锁，这样key的前缀可以直接默认根据`类+方法名`来实现，同样针对特例我们也提供了自己指定前缀的入口。
+
+#### 实现切面RedissonLockAspect
+
+```java
+package com.luoying.luochat.common.common.aspect;
+
+import cn.hutool.core.util.StrUtil;
+import com.luoying.luochat.common.common.annotation.RedissonLock;
+import com.luoying.luochat.common.common.service.LockServcie;
+import com.luoying.luochat.common.common.utils.SpElUtils;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+import java.lang.reflect.Method;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 18:00
+ */
+@Component
+@Aspect
+@Order(0) // 确保比事务注解@Transactional先执行，也就是先加锁，然后开启事务，再提交事务，最后释放锁
+public class RedissonAspect {
+
+    @Resource
+    private LockServcie lockServcie;
+
+    @Around("@annotation(redissonLock)")
+    public Object around(ProceedingJoinPoint joinPoint,RedissonLock redissonLock) {
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        Method method = signature.getMethod();
+        String prefix = StrUtil.isBlank(redissonLock.prefix()) ? SpElUtils.getPrefixByMethod(method) : redissonLock.prefix();
+        String key = SpElUtils.getKeyByParseSpEl(method, joinPoint.getArgs(), redissonLock.key());
+        return lockServcie.executeWithLock(prefix + ":" + key, redissonLock.waitTime(), redissonLock.timeUnit(), joinPoint::proceed);
+    }
+}
+```
+
+切面其实很简单，构建最终的键=`prefix:key`，然后把参数都传进去，调用我们核心功能的工具类`LockService`。
+
+#### 编写SpElUtils工具类
+
+```java
+package com.luoying.luochat.common.common.utils;
+
+import org.springframework.core.DefaultParameterNameDiscoverer;
+import org.springframework.expression.EvaluationContext;
+import org.springframework.expression.Expression;
+import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.expression.spel.support.StandardEvaluationContext;
+
+import java.lang.reflect.Method;
+import java.util.Optional;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 18:10
+ */
+public class SpElUtils {
+
+    private static final ExpressionParser PARSER = new SpelExpressionParser();
+    private static final DefaultParameterNameDiscoverer PARAMETER_NAME_DISCOVERER = new DefaultParameterNameDiscoverer();
+
+    public static String getPrefixByMethod(Method method) {
+        // 获取方法的全限定名
+        return method.getDeclaringClass() + "." + method.getName();
+    }
+
+    public static String getKeyByParseSpEl(Method method, Object[] args, String key) {
+        // 获取方法的参数名列表
+        String[] paramNames = Optional.ofNullable(PARAMETER_NAME_DISCOVERER.getParameterNames(method)).orElse(new String[0]);
+        // 创建一个评估上下文对象（context），用于存储参数名和参数值的映射关系。
+        EvaluationContext context = new StandardEvaluationContext();//el解析需要的上下文对象
+        // 遍历参数名列表，将每个参数名与对应的参数值关联起来，并将它们添加到评估上下文中。
+        for (int i = 0; i < paramNames.length; i++) {
+            context.setVariable(paramNames[i], args[i]);//所有参数都作为原材料扔进去
+        }
+        // 使用SpEL解析器（PARSER）解析给定的SpEL表达式
+        Expression expression = PARSER.parseExpression(key);
+        // 使用解析得到的表达式对象（expression）在评估上下文中计算结果，并返回该结果的字符串表示形式。
+        return expression.getValue(context, String.class);
+    }
+}
+
+```
+
+#### 修改LockService
+
+因为joinPoint调用proceed方法会抛异常，但官方的Supplier的get方法没有主动抛异常，我们不用它，自己定义一个内部接口类Supplier
+
+```java
+@FunctionalInterface
+public interface Supplier<T> {
+    /**
+     * Gets a result.
+     *
+     * @return a result
+     */
+    T get() throws Throwable;
+}
+```
+
+
+
+#### 使用
+
+```java
+@Override
+@Transactional(rollbackFor = Exception.class)
+@RedissonLock(key = "#uid")
+public void modifyName(Long uid, String name) {
+    User user = userDao.getByName(name);
+    // 使用AssertUtil的isEmpty方法判断user是否为空，不为空就会抛出BusinessException
+    // errorMsg就是isEmpty方法的第二个参数
+    AssertUtil.isEmpty(user, "名字重复，换个名字再尝试吧~~");
+    // 获取该用户第一个可用的改名卡，然后使用掉
+    UserBackpack modifyNameItem = userBackpackDao.getFirstValidItem(uid, ItemEnum.MODIFY_NAME_CARD.getId());
+    AssertUtil.isNotEmpty(modifyNameItem, "无可用改名卡哦");
+    // 使用改名卡
+    boolean success = userBackpackDao.useItem(modifyNameItem);
+    if (success) { // 改名
+        userDao.modifyName(uid, name);
+    }
+}
+```
