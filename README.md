@@ -8385,3 +8385,881 @@ public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws E
 我们可以使用mq实现，设置多个消费者，每个消费者可以在不同服务器，提高用户ip解析的速度和吞吐，解决淘宝IP解析API的频控问题，因为它是根据服务器ip来频控的。同时，如果失败了，mq可以进行消息重发，直到消息确认。
 
 但需要对mq的并发进行一定的控制，不然会造成大量的竞争和失败。所要限制mq的消费并发度，可以consumeThreadNumber设置为1。
+
+
+
+## 黑名单功能
+
+作为一个聊天网站，最重要的就是言论的约束。如果有人发出一些不恰当的言论，必须要有应对的方案，因此，我们采用了两种手段来进行约束，分别是**撤回**和**拉黑**
+
+
+
+### 权限设计
+
+拉黑功能是管理员的专属功能。为了前后端能够识别管理员，我们需要专门设计一套权限管理系统。
+
+传统的权限设计是：
+
+1. 一个用户可以有多个角色
+2. 一个角色对应多种权限
+3. 权限包含多种资源，比如接口，按钮，菜单
+
+最后整合起来，通过判断用户是否有该资源，来确定用户能否访问。角色只是个桥梁。
+
+![image-20240108155852769](assets/image-20240108155852769.png)
+
+权限管理多用于b端项目，对于c端来说，权限级别没有必要那么复杂。因此，我们和前端约定，做到角色的级别就行，角色有什么权限，前后端写死就行。
+
+我们设置了两个角色，超管拥有所有权限（撤回和拉黑），普通管理员拥有撤回的权限。
+
+### 拉黑设计
+
+#### 存储结构
+
+![image-20240108160923889](assets/image-20240108160923889.png)
+
+拉黑目标类型可以是ip，uid，设备号等，用一个type来表示。`target`就是具体的目标值。构建（type+target）的联合索引。
+
+一个用户可以有多个角色，一个角色也能属于多个用户，因此抽出了一张用户角色表
+
+#### 创建表
+
+```sql
+CREATE TABLE `black`  (
+  `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `type` int(11) NOT NULL COMMENT '拉黑目标类型 1.ip 2uid',
+  `target` varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '拉黑目标',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE INDEX `idx_type_target`(`type`, `target`) USING BTREE
+) COMMENT = '黑名单' ROW_FORMAT = Dynamic;
+CREATE TABLE `role` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `name` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '角色名称',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) COMMENT='角色表';
+CREATE TABLE `user_role` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `uid` bigint(20) NOT NULL COMMENT 'uid',
+  `role_id` bigint(20) NOT NULL COMMENT '角色id',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_uid` (`uid`) USING BTREE,
+  KEY `idx_role_id` (`role_id`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) COMMENT='用户角色关系表';
+insert into role(id,`name`) values(1,'超级管理员');
+insert into role(id,`name`) values(2,'普通管理员');
+```
+
+#### 代码生成
+
+```java
+package com.luoying.luochat.common;
+
+import com.baomidou.mybatisplus.annotation.DbType;
+import com.baomidou.mybatisplus.annotation.FieldFill;
+import com.baomidou.mybatisplus.generator.AutoGenerator;
+import com.baomidou.mybatisplus.generator.config.DataSourceConfig;
+import com.baomidou.mybatisplus.generator.config.GlobalConfig;
+import com.baomidou.mybatisplus.generator.config.PackageConfig;
+import com.baomidou.mybatisplus.generator.config.StrategyConfig;
+import com.baomidou.mybatisplus.generator.config.po.TableFill;
+import com.baomidou.mybatisplus.generator.config.rules.NamingStrategy;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class MPGenerator {
+    public static void main(String[] args) {
+        //代码生成器
+        AutoGenerator autoGenerator = new AutoGenerator();
+
+        //数据源配置
+        DataSourceConfig dataSourceConfig = new DataSourceConfig();
+        dataSourceConfig.setDbType(DbType.MYSQL);//指定数据库类型
+        //---------------------------数据源-----------------------------------
+        assembleDev(dataSourceConfig);//配置数据源
+        autoGenerator.setDataSource(dataSourceConfig);
+
+        //全局配置
+        GlobalConfig globalConfig = new GlobalConfig();
+        globalConfig.setOpen(false);
+        //todo 要改输出路径
+        globalConfig.setOutputDir(System.getProperty("user.dir") + "/luochat-chat-server/src/main/java");
+        //设置作者名字
+        globalConfig.setAuthor("<a href=\"https://github.com/1ranxu\">luoying</a>");
+        //去掉service的I前缀,一般只需要设置service就行
+        globalConfig.setServiceImplName("%sDao");
+        autoGenerator.setGlobalConfig(globalConfig);
+
+        //包配置
+        PackageConfig packageConfig = new PackageConfig();
+        packageConfig.setParent("com.luoying.luochat.common.user");//自定义包的路径
+        packageConfig.setEntity("domain.entity");
+        packageConfig.setMapper("mapper");
+        packageConfig.setController("controller");
+        packageConfig.setServiceImpl("dao");
+        autoGenerator.setPackageInfo(packageConfig);
+
+        //策略配置
+        StrategyConfig strategyConfig = new StrategyConfig();
+        //是否使用Lombok
+        strategyConfig.setEntityLombokModel(true);
+        //包，列的命名规则，使用驼峰规则
+        strategyConfig.setNaming(NamingStrategy.underline_to_camel);
+        //strategyConfig.setTablePrefix("t_");
+        strategyConfig.setColumnNaming(NamingStrategy.underline_to_camel);
+        //字段和表注解
+        strategyConfig.setEntityTableFieldAnnotationEnable(true);
+        //todo 这里修改需要自动生成的表结构
+        strategyConfig.setInclude(
+                "black",
+                "role",
+                "user_role"
+        );
+        //自动填充字段,在项目开发过程中,例如创建时间，修改时间,每次，都需要我们来指定，太麻烦了,设置为自动填充规则，就不需要我们赋值咯
+        List<TableFill> list = new ArrayList<TableFill>();
+        TableFill tableFill1 = new TableFill("create_time", FieldFill.INSERT);
+        TableFill tableFill2 = new TableFill("update_time", FieldFill.INSERT_UPDATE);
+        list.add(tableFill1);
+        list.add(tableFill2);
+
+        //strategyConfig.setTableFillList(list);
+        autoGenerator.setStrategy(strategyConfig);
+
+        //执行
+        autoGenerator.execute();
+
+    }
+    //todo 这里修改你的数据源
+    public static void assembleDev(DataSourceConfig dataSourceConfig) {
+        dataSourceConfig.setDriverName("com.mysql.cj.jdbc.Driver");
+        dataSourceConfig.setUsername("root");
+        dataSourceConfig.setPassword("115474287zxcczld");
+        dataSourceConfig.setUrl("jdbc:mysql://192.168.253.128:3306/luochat?useUnicode=true&characterEncoding=utf-8&useSSL=true&serverTimezone=UTC");
+    }
+}
+```
+
+![image-20240108162330231](assets/image-20240108162330231.png)
+
+![image-20240108170146145](assets/image-20240108170146145.png)
+
+
+
+#### 拦截时间
+
+通过`拦截器`，对每一个接口的请求都进行黑名单的校验。
+
+
+
+#### 黑名单缓存
+
+黑名单是一个相对静态的数据，并且需要比较实时的判断，可以将它`缓存`在redis里。对于单机来说，也能缓存在本地内存里。
+
+
+
+### 实现
+
+#### 返回角色信息
+
+首先在用户认证成功的时候，需要给前端返回用户所属的角色
+
+```java
+package com.luoying.luochat.common.user.domain.enums;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+import java.util.Arrays;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * Description: 角色枚举
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 16:51
+ */
+@AllArgsConstructor
+@Getter
+public enum RoleEnum {
+    SUPER_ADMIN(1L, "超级管理员"),
+    GENERAL_MANAGER(2L, "普通管理员"),
+    ;
+
+    private final Long id;
+    private final String desc;
+
+    private static Map<Long, RoleEnum> cache;
+
+    static {
+        cache = Arrays.stream(RoleEnum.values()).collect(Collectors.toMap(RoleEnum::getId, Function.identity()));
+    }
+
+    public static RoleEnum of(Long type) {
+        return cache.get(type);
+    }
+}
+
+```
+
+
+
+#### 管理员拉黑
+
+##### 权限判断
+
+调用拉黑接口，需要校验调用者是否为超级管理员权限。
+
+```java
+@Resource
+private RoleService roleService;
+
+private void loginSuccess(Channel channel, User user, String token) {
+    // 保存channel和uid的映射关系
+    WSChannelExtraDTO wsChannelExtraDTO = ONLINE_WS_MAP.get(channel);
+    wsChannelExtraDTO.setUid(user.getId());
+    // 推送用户登录成功消息
+    sendMsg(channel, WebSocketAdapter.buildResp(user, token,roleService.hasWhatPower(user.getId())));
+    // 更新用户上线时间
+    user.setLastOptTime(new Date());
+    // 更新user的ipInfo
+    user.refreshIp(NettyUtil.getValueInAttr(channel,NettyUtil.IP));
+    // 发送用户上线成功的事件，谁关心谁来处理
+    applicationEventPublisher.publishEvent(new UserOnlineEvent(this,user));
+}
+```
+
+```java
+package com.luoying.luochat.common.user.service.impl;
+
+import com.luoying.luochat.common.user.domain.enums.RoleEnum;
+import com.luoying.luochat.common.user.service.RoleService;
+import com.luoying.luochat.common.user.service.cache.UserCache;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.Resource;
+import java.util.Set;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 17:08
+ */
+@Service
+public class RoleServiceImpl implements RoleService {
+    @Resource
+    private UserCache userCache;
+
+    @Override
+    public RoleEnum hasWhatPower(Long uid) {// 后期做成权限 => 资源模式
+        // 获取该用户拥有的所有角色
+        Set<Long> roleSet = userCache.getRoleSet(uid);
+        // 返回该用户拥有的最高权限
+        if (roleSet.contains(RoleEnum.SUPER_ADMIN.getId())) {
+            return RoleEnum.SUPER_ADMIN;
+        } else if (roleSet.contains(RoleEnum.GENERAL_MANAGER.getId())) {
+            return RoleEnum.GENERAL_MANAGER;
+        } else
+            return null;
+
+    }
+
+}
+
+```
+
+```java
+package com.luoying.luochat.common.user.service.cache;
+
+import com.luoying.luochat.common.user.dao.UserRoleDao;
+import com.luoying.luochat.common.user.domain.entity.UserRole;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+/**
+ * Description: 用户相关缓存
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 17:08
+ */
+@Component
+public class UserCache {
+    @Resource
+    private UserRoleDao userRoleDao;
+
+
+    @Cacheable(cacheNames = "user", key = "'roles'+#uid")
+    public Set<Long> getRoleSet(Long uid) {
+        List<UserRole> userRoles = userRoleDao.listByUid(uid);
+        return userRoles.stream()
+                .map(UserRole::getRoleId)
+                .collect(Collectors.toSet());
+    }
+}
+
+```
+
+```java
+package com.luoying.luochat.common.user.dao;
+
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.luoying.luochat.common.user.domain.entity.UserRole;
+import com.luoying.luochat.common.user.mapper.UserRoleMapper;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * <p>
+ * 用户角色关系表 服务实现类
+ * </p>
+ *
+ * @author <a href="https://github.com/1ranxu">luoying</a>
+ * @since 2024-01-08
+ */
+@Service
+public class UserRoleDao extends ServiceImpl<UserRoleMapper, UserRole> {
+
+    public List<UserRole> listByUid(Long uid) {
+        return lambdaQuery()
+                .eq(UserRole::getUid, Objects.requireNonNull(uid))
+                .list();
+    }
+}
+
+```
+
+`WebSocketAdapter`
+
+```java
+public static WSBaseResp<?> buildResp(User user, String token, RoleEnum roleEnum) {
+    int power = 0;
+    if (Objects.isNull(roleEnum)) {
+        ;
+    } else if (RoleEnum.SUPER_ADMIN.getId().equals(roleEnum.getId())) {
+        power = 1;
+    } else if (RoleEnum.GENERAL_MANAGER.getId().equals(roleEnum.getId())) {
+        power = 2;
+    }
+    WSBaseResp<WSLoginSuccess> resp = new WSBaseResp<>();
+    WSLoginSuccess wsLoginSuccess = WSLoginSuccess.builder()
+            .uid(user.getId())
+            .avatar(user.getAvatar())
+            .token(token)
+            .name(user.getName())
+            .power(power).build();
+    resp.setType(WSRespTypeEnum.LOGIN_SUCCESS.getType());
+    resp.setData(wsLoginSuccess);
+    return resp;
+}
+```
+
+
+
+##### 用户拉黑
+
+将用户的uid和ip加入黑名单，保存到数据库。
+
+```java
+package com.luoying.luochat.common.user.domain.vo.req;
+
+import io.swagger.annotations.ApiModelProperty;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import javax.validation.constraints.NotNull;
+
+/**
+ * 拉黑请求
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 17:40
+ */
+@Data
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+public class BlackReq {
+    @NotNull
+    @ApiModelProperty("拉黑目标uid")
+    private Long uid;
+}
+
+```
+
+`UserController`
+
+```java
+@PutMapping("/black")
+@ApiOperation("拉黑用户")
+public ApiResult<Void> black(@Valid @RequestBody BlackReq blackReq) {
+    // 获取当前登录用户uid
+    Long uid = RequestHolder.get().getUid();
+    // 获取当前登录用户的角色
+    RoleEnum roleEnum = roleService.hasWhatPower(uid);
+    // 判断角色是否为超级管理员
+    AssertUtil.isNotEmpty(roleEnum,"无权限");
+    AssertUtil.isTrue(RoleEnum.SUPER_ADMIN.getId().equals(roleEnum.getId()), "无权限");
+    // 拉黑
+    return ApiResult.success(userService.black(blackReq));
+}
+```
+
+`UserServiceImpl`
+
+```java
+@Resource
+private BlackDao blackDao;
+
+@Override
+public Void black(BlackReq blackReq) {
+    // 获取要拉黑的uid
+    Long uid = blackReq.getUid();
+    // 拉黑uid
+    Black black = new Black();
+    black.setType(BlackTypeEnum.UID.getType());
+    black.setTarget(uid.toString());
+    blackDao.save(black);
+    User user = userDao.getById(uid);
+    // 拉黑ip
+    blackIp(user.getIpInfo().getCreateIp());
+    blackIp(user.getIpInfo().getUpdateIp());
+    return null;
+}
+public void blackIp(String ip) {
+    if (StrUtil.isBlank(ip)) { // ip有可能为空
+        return;
+    }
+    try {
+        // 拉黑ip
+        Black black = new Black();
+        black.setType(BlackTypeEnum.IP.getType());
+        black.setTarget(ip);
+        blackDao.save(black);
+    } catch (Exception e) {
+        log.error("duplicate black ip:{}", ip);
+    }
+}
+```
+
+```java
+package com.luoying.luochat.common.user.domain.enums;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+/**
+ * Description: 拉黑目标类型
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 18:47
+ */
+@AllArgsConstructor
+@Getter
+public enum BlackTypeEnum {
+    IP(1),
+    UID(2),
+    ;
+
+    private final Integer type;
+
+}
+```
+
+
+
+##### 发出拉黑事件
+
+发送拉黑事件，关心该事件的消费者做了三件事
+
+1. 清除相关的缓存，让拉黑立马生效
+2. 对该用户所有的消息都进行删除，以后不会出现在消息列表
+3. 给所有在线用户推送用户拉黑事件
+
+```java
+package com.luoying.luochat.common.common.event;
+
+import com.luoying.luochat.common.user.domain.entity.User;
+import lombok.Getter;
+import org.springframework.context.ApplicationEvent;
+
+@Getter
+public class UserBlackEvent extends ApplicationEvent {
+    private final User user;
+
+    public UserBlackEvent(Object source, User user) {
+        super(source);
+        this.user = user;
+    }
+}
+```
+
+`UserServiceImpl`
+
+```java
+@Resource
+private ApplicationEventPublisher applicationEventPublisher;
+@Override
+@Transactional(rollbackFor = Exception.class)
+public Void black(BlackReq blackReq) {
+    // 获取要拉黑的uid
+    Long uid = blackReq.getUid();
+    // 拉黑uid
+    Black black = new Black();
+    black.setType(BlackTypeEnum.UID.getType());
+    black.setTarget(uid.toString());
+    blackDao.save(black);
+    User user = userDao.getById(uid);
+    // 拉黑ip
+    blackIp(user.getIpInfo().getCreateIp());
+    blackIp(user.getIpInfo().getUpdateIp());
+    // 发送用户拉黑事件
+    applicationEventPublisher.publishEvent(new UserBlackEvent(this,user));
+    return null;
+}
+```
+
+```java
+package com.luoying.luochat.common.common.event.listener;
+
+import com.luoying.luochat.common.common.event.UserBlackEvent;
+import com.luoying.luochat.common.user.dao.UserDao;
+import com.luoying.luochat.common.user.domain.entity.User;
+import com.luoying.luochat.common.websocket.service.WebSocketService;
+import com.luoying.luochat.common.websocket.service.adapter.WebSocketAdapter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+import javax.annotation.Resource;
+
+/**
+ * 用户拉黑监听器
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 19:05
+ */
+@Slf4j
+@Component
+public class UserBlackListener {
+    @Resource
+    private WebSocketService webSocketService;
+
+    @Resource
+    private UserDao userDao;
+
+    @Async
+    @TransactionalEventListener(classes = UserBlackEvent.class,phase = TransactionPhase.AFTER_COMMIT)
+    public void sendMsg(UserBlackEvent event) {
+        User user = event.getUser();
+        // 向所有在线用户发送拉黑消息
+        webSocketService.sendMsgToAll(WebSocketAdapter.buildBlcakResp(user));
+    }
+    @Async
+    @TransactionalEventListener(classes = UserBlackEvent.class,phase = TransactionPhase.AFTER_COMMIT)
+    public void changeUserStatus(UserBlackEvent event) {
+        // 把该用户的状态改为拉黑
+        userDao.invalidUid(event.getUser().getId());
+    }
+}
+
+```
+
+`UserDao`
+
+```java
+public void invalidUid(Long uid) {
+    lambdaUpdate()
+            .eq(User::getId,uid)
+            .set(User::getStatus, YesOrNoEnum.YES.getStatus())
+            .update();
+}
+```
+
+#### websocket推送拉黑消息
+
+某些用户发表了不恰当的言论，被拉黑后。这时候需要立马通知到所有在线用户，前端接收到拉黑通知，使用拉黑的uid与消息列表和成员列表进行匹配，把该uid的所有消息从前端缓存中删除。
+
+`ThreadPoolConfig`
+
+```java
+@Bean(WS_EXECUTOR)
+public ThreadPoolTaskExecutor websocketExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setWaitForTasksToCompleteOnShutdown(true);// 线程池优雅停机
+    executor.setCorePoolSize(16);
+    executor.setMaxPoolSize(16);
+    executor.setQueueCapacity(1000);
+    executor.setThreadNamePrefix("websocket-executor-");
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardPolicy());// 队列满了直接丢弃
+    executor.setThreadFactory(new MyThreadFactory(executor));
+    executor.initialize();
+    return executor;
+}
+```
+
+`WebSocketServiceImpl`
+
+```java
+@Resource
+@Qualifier(ThreadPoolConfig.WS_EXECUTOR)
+private ThreadPoolTaskExecutor threadPoolTaskExecutor;
+
+@Override
+public void sendMsgToAll(WSBaseResp<?> msg) {
+    ONLINE_WS_MAP.forEach((channel, wsChannelExtraDTO) -> {
+        threadPoolTaskExecutor.execute(() -> {
+            sendMsg(channel, msg);
+        });
+    });
+}
+```
+
+
+
+#### 拦截拉黑用户
+
+被拉黑的用户以后再也没法访问该网站了。
+
+在拦截器中，从内存取出所有的黑名单列表Set，对请求者的ip和uid进行匹配。如果存在，就拒绝访问。
+
+```java
+package com.luoying.luochat.common.common.interceptor;
+
+import cn.hutool.core.collection.CollectionUtil;
+import com.luoying.luochat.common.common.domain.dto.RequestInfo;
+import com.luoying.luochat.common.common.exception.HttpErrorEnum;
+import com.luoying.luochat.common.common.utils.RequestHolder;
+import com.luoying.luochat.common.user.domain.enums.BlackTypeEnum;
+import com.luoying.luochat.common.user.service.cache.UserCache;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+import javax.annotation.Resource;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * 黑名单拦截
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 20：03
+ */
+@Slf4j
+@Component
+public class BlackInterceptor implements HandlerInterceptor {
+
+    @Resource
+    private UserCache userCache;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        // 获取黑名单的map，key是type，value是target的集合
+        Map<Integer, Set<String>> blackMap = userCache.getBlackMap();
+        RequestInfo requestInfo = RequestHolder.get();
+        // 判断用户uid是否在黑名单
+        if (inBlackList(requestInfo.getUid(), blackMap.get(BlackTypeEnum.UID.getType()))) {
+            HttpErrorEnum.ACCESS_DENIED.sendHttpError(response);
+            return false;
+        }
+        // 判断用户ip是否在黑名单
+        if (inBlackList(requestInfo.getIp(), blackMap.get(BlackTypeEnum.IP.getType()))) {
+            HttpErrorEnum.ACCESS_DENIED.sendHttpError(response);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean inBlackList(Object target, Set<String> blackSet) {
+        if (Objects.isNull(target) || CollectionUtil.isEmpty(blackSet)) {
+            return false;
+        }
+        return blackSet.contains(target.toString());
+    }
+
+}
+```
+
+```java
+package com.luoying.luochat.common.user.service.cache;
+
+import com.luoying.luochat.common.user.dao.BlackDao;
+import com.luoying.luochat.common.user.dao.UserRoleDao;
+import com.luoying.luochat.common.user.domain.entity.Black;
+import com.luoying.luochat.common.user.domain.entity.UserRole;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+/**
+ * Description: 用户相关缓存
+ *
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 17:08
+ */
+@Component
+public class UserCache {
+    @Resource
+    private UserRoleDao userRoleDao;
+
+    @Resource
+    private BlackDao blackDao;
+
+    /**
+     * 获取角色缓存
+     */
+    @Cacheable(cacheNames = "user", key = "'roles'+#uid")
+    public Set<Long> getRoleSet(Long uid) {
+        List<UserRole> userRoles = userRoleDao.listByUid(uid);
+        return userRoles.stream()
+                .map(UserRole::getRoleId)
+                .collect(Collectors.toSet());
+    }
+
+    /**
+     *获取黑名单缓存
+     */
+    @Cacheable(cacheNames = "user", key = "'blackMap'")
+    public Map<Integer, Set<String>> getBlackMap() {
+        Map<Integer, List<Black>> map = blackDao.list().stream().collect(Collectors.groupingBy(Black::getType));
+        Map<Integer, Set<String>> resultMap = new HashMap<>();
+        map.forEach((type, list) -> {
+            resultMap.put(type, list.stream().map(black -> black.getTarget()).collect(Collectors.toSet()));
+        });
+        return resultMap;
+    }
+
+    /**
+     * 清空黑名单缓存
+     * @return
+     */
+    @CacheEvict(cacheNames = "user", key = "'blackList'")
+    public Map<Integer, Set<String>> evictBlackMap() {
+        return null;
+    }
+}
+```
+
+```java
+package com.luoying.luochat.common.common.event.listener;
+
+import com.luoying.luochat.common.common.event.UserBlackEvent;
+import com.luoying.luochat.common.user.dao.UserDao;
+import com.luoying.luochat.common.user.domain.entity.User;
+import com.luoying.luochat.common.user.service.cache.UserCache;
+import com.luoying.luochat.common.websocket.service.WebSocketService;
+import com.luoying.luochat.common.websocket.service.adapter.WebSocketAdapter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+import javax.annotation.Resource;
+
+/**
+ * 用户拉黑监听器
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 19:05
+ */
+@Slf4j
+@Component
+public class UserBlackListener {
+    @Resource
+    private WebSocketService webSocketService;
+
+    @Resource
+    private UserDao userDao;
+
+    @Resource
+    private UserCache userCache;
+
+    @Async
+    @TransactionalEventListener(classes = UserBlackEvent.class,phase = TransactionPhase.AFTER_COMMIT)
+    public void sendMsg(UserBlackEvent event) {
+        User user = event.getUser();
+        // 向所有在线用户发送拉黑消息
+        webSocketService.sendMsgToAll(WebSocketAdapter.buildBlcakResp(user));
+    }
+    @Async
+    @TransactionalEventListener(classes = UserBlackEvent.class,phase = TransactionPhase.AFTER_COMMIT)
+    public void changeUserStatus(UserBlackEvent event) {
+        // 把该用户的状态改为拉黑
+        userDao.invalidUid(event.getUser().getId());
+    }
+
+    @Async
+    @TransactionalEventListener(classes = UserBlackEvent.class,phase = TransactionPhase.AFTER_COMMIT)
+    public void evictCache(UserBlackEvent event) {
+        // 清空黑名单缓存，因为黑名单又新增了，旧的就需要清除
+        userCache.evictBlackMap();
+    }
+
+
+}
+```
+
+```java
+package com.luoying.luochat.common.common.config;
+
+import com.luoying.luochat.common.common.interceptor.BlackInterceptor;
+import com.luoying.luochat.common.common.interceptor.CollectorInterceptor;
+import com.luoying.luochat.common.common.interceptor.TokenInterceptor;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+import javax.annotation.Resource;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 12:10
+ */
+@Configuration
+public class InterceptorConfig implements WebMvcConfigurer {
+
+    @Resource
+    private TokenInterceptor tokenInterceptor;
+
+    @Resource
+    private CollectorInterceptor collectorInterceptor;
+
+    @Resource
+    private BlackInterceptor blackInterceptor;
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {// 注意拦截器的添加顺序
+        registry.addInterceptor(tokenInterceptor)
+                .addPathPatterns("/capi/**");
+        registry.addInterceptor(collectorInterceptor)
+                .addPathPatterns("/capi/**");
+        registry.addInterceptor(blackInterceptor)
+                .addPathPatterns("/capi/**");
+    }
+}
+```
