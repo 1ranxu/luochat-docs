@@ -7619,3 +7619,769 @@ public void doAcquireItem(Long uid, Long itemId, String idempotent) {
     userBackpackDao.save(insert);
 }
 ```
+
+
+
+## ip归属地
+
+### 基于淘宝开放接口
+
+淘宝的IP地址库API可以提供IP地址的详细信息，包括国家、省份、城市、经纬度等
+
+```sh
+curl --request GET \
+  --url 'https://ip.taobao.com/outGetIpInfo?ip=112.96.166.230&accessKey=alibaba-inc' \
+  --header 'content-type: application/json' 
+```
+
+![image-20240108132902081](assets/image-20240108132902081.png)
+
+缺点：就是有频率控制，短时间请求太多次，会请求失败，建议请求失败后，等一会再请求
+
+![image-20240108133110516](assets/image-20240108133110516.png)
+
+我们需要写一套框架，去适应淘宝地址解析的频控。解析的请求进入线程池排队，失败后最多重试三次，每次重试间隔2秒，整个过程是异步的，不会阻塞主线程，影响用户登录。
+
+### ip的获取
+
+#### http请求
+
+在拦截器中，使用`hutool`的工具类获取请求头中携带的`ip`，将用户的`ip`设置进上下文即可，之后在controller层的接口中就可获取了
+
+```java
+package com.luoying.luochat.common.common.interceptor;
+
+import cn.hutool.extra.servlet.ServletUtil;
+import com.luoying.luochat.common.common.domain.dto.RequestInfo;
+import com.luoying.luochat.common.common.utils.RequestHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.util.Optional;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/6 12:41
+ */
+@Component
+public class CollectorInterceptor implements HandlerInterceptor {
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        // 从request的attribute中获取token
+        Long uid = Optional.ofNullable(request.getAttribute(TokenInterceptor.UID))
+                .map(Object::toString)
+                .map(Long::parseLong)
+                .get();
+        // 获取ip
+        String ip = ServletUtil.getClientIP(request);
+        // 封装
+        RequestInfo requestInfo = new RequestInfo();
+        requestInfo.setUid(uid);
+        requestInfo.setIp(ip);
+        // 存入ThreadLocal
+        RequestHolder.set(requestInfo);
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
+        // 使用完需要移除
+        RequestHolder.remove();
+    }
+}
+```
+
+需要注意，如果我们使用`nginx`来代理请求，需要在`nginx`里面保存用户真实`ip`到请求头`X-Real-IP`，之后通过这个请求头来获取真实`ip`，否则拿到是nginx的ip地址。
+
+#### websocket请求
+
+`websocket`请求获取`ip`会有点麻烦。
+
+首先`websocket`初期会借助`http`来升级协议。我们需要在`http`升级前获取`ip`，然后将用户`ip`保存起来。
+
+协议升级前，会调用`MyTokenCollectHandler`处理器，此时能拿到`http`的`request`，然后根据`X-Real-IP`请求头获取`ip`。最后移除该处理器。因为只有在连接建立时才需要获取token和ip，连接建立后就不需要了。
+
+协议升级后，`websocket`连接建立完成，请求就不会再走这个处理器，所以我们的`ip`需要保存起来。我们可以把`ip`作为`channel`的附件保存。之后每次的`websocket`请求，都用的是同一个`channel`，就从里面取`ip`。
+
+```java
+package com.luoying.luochat.common.websocket.service.handler;
+
+import cn.hutool.core.net.url.UrlBuilder;
+import cn.hutool.core.util.StrUtil;
+import com.luoying.luochat.common.websocket.NettyUtil;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.http.HttpRequest;
+
+import java.net.InetSocketAddress;
+import java.util.Optional;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 13:29
+ */
+public class MyTokenCollectHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        if (msg instanceof HttpRequest) { // 如果是http请求，说明需要进行握手升级
+            final HttpRequest request = (HttpRequest) msg;
+            UrlBuilder urlBuilder = UrlBuilder.ofHttp(request.getUri());
+            Optional<String> tokenOptional = Optional.ofNullable(urlBuilder)
+                    .map(UrlBuilder::getQuery)
+                    .map(urlQuery -> urlQuery.get("token"))
+                    .map(CharSequence::toString);
+            // 如果token存在，保存token
+            tokenOptional.ifPresent(s -> NettyUtil.setValueToAttr(ctx.channel(), NettyUtil.TOKEN, s));
+            // 还原request的路径
+            request.setUri(urlBuilder.getPath().toString());
+            // 取用户的ip
+            String ip = request.headers().get("X-Real-IP");
+            if (StrUtil.isBlank(ip)) {
+                InetSocketAddress address = (InetSocketAddress) ctx.channel().remoteAddress();
+                ip = address.getAddress().getHostAddress();
+            }
+            // 保存到channel
+            NettyUtil.setValueToAttr(ctx.channel(), NettyUtil.IP, ip);
+            ctx.channel().pipeline().remove(this);
+        }
+        ctx.fireChannelRead(msg);
+    }
+}
+```
+
+```java
+package com.luoying.luochat.common.websocket;
+
+import io.netty.channel.Channel;
+import io.netty.util.Attribute;
+import io.netty.util.AttributeKey;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/5 16:43
+ */
+public class NettyUtil {
+    public static AttributeKey<String> TOKEN = AttributeKey.valueOf("token");
+    public static AttributeKey<String> IP = AttributeKey.valueOf("ip");
+
+    public static <T> void setValueToAttr(Channel channel,AttributeKey<T> key,T vlaue){
+        Attribute<T> attr = channel.attr(key);
+        attr.set(vlaue);
+    }
+
+    public static <T> T getValueInAttr(Channel channel,AttributeKey<T> key){
+        Attribute<T> attr = channel.attr(key);
+        return attr.get();
+    }
+}
+
+```
+
+### 实现json字段
+
+有些很复杂的信息，我们会用mysql5.7以后支持的json类型的字段，该字段一般用text类型存在数据库，具有进行sql查询与修改json内的某个字段的能力。
+
+#### 设置的字段为json类型
+
+```sql
+`ip_info` json DEFAULT NULL COMMENT 'ip信息',
+```
+
+#### 查询json字段里的某个子字段
+
+```sql
+select * from `user` where ip_info->'$.createIp' ='113.110.223.73'
+```
+
+#### 配置实体类
+
+设置自动生成resultmap
+
+![image-20240108123940831](assets/image-20240108123940831.png)
+
+![image-20240108124043777](assets/image-20240108124043777.png)
+
+```java
+package com.luoying.luochat.common.user.domain.entity;
+
+import cn.hutool.core.util.StrUtil;
+import lombok.Data;
+import org.apache.commons.lang3.StringUtils;
+
+import java.io.Serializable;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * 用户ip信息
+ *
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 9:43
+ */
+@Data
+public class IpInfo implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+    //注册时的ip
+    private String createIp;
+    //注册时的ip详情
+    private IpDetail createIpDetail;
+    //最新登录的ip
+    private String updateIp;
+    //最新登录的ip详情
+    private IpDetail updateIpDetail;
+}
+```
+
+```java
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+/**
+ * 用户ip信息
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 9:43
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class IpDetail implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+    //注册时的ip
+    private String ip;
+    //最新登录的ip
+    private String isp;
+    private String isp_id;
+    private String city;
+    private String city_id;
+    private String country;
+    private String country_id;
+    private String region;
+    private String region_id;
+}
+```
+
+`ApiResult`也需要添加`@JsonIgnoreProperties(ignoreUnknown = true)`注解，方便后面解析ip
+
+### ip的更新
+
+不可能用户每次请求，我们都要去做一次ip更新。可以在用户认证成功后去更新ip。
+
+用户认证成功有两个场景：
+
+1.用户浏览器保存有token，前端请求携带token与后端认证成功。
+
+2.用户token失效重新扫码登录成功
+
+两者都会调用loginSuccess方法，我们可以在这里来触发ip的刷新。
+
+```java
+package com.luoying.luochat.common.common.event;
+
+import com.luoying.luochat.common.user.domain.entity.User;
+import lombok.Getter;
+import org.springframework.context.ApplicationEvent;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 9:34
+ */
+@Getter
+public class UserOnlineEvent extends ApplicationEvent {
+    private User user;
+
+    public UserOnlineEvent(Object source, User user) {// source就是事件发送者
+        super(source);
+        this.user = user;
+    }
+}
+```
+
+```java
+@Resource
+private ApplicationEventPublisher applicationEventPublisher;
+
+private void loginSuccess(Channel channel, User user, String token) {
+    // 保存channel和uid的映射关系
+    WSChannelExtraDTO wsChannelExtraDTO = ONLINE_WS_MAP.get(channel);
+    wsChannelExtraDTO.setUid(user.getId());
+    // 推送用户登录成功消息
+    sendMsg(channel, WebSocketAdapter.buildResp(user, token));
+    // 更新用户上线时间
+    user.setLastOptTime(new Date());
+    // 更新user的ipInfo
+    user.refreshIp(NettyUtil.getValueInAttr(channel,NettyUtil.IP));
+    // 发送用户上线成功的事件，谁关心谁来处理
+    applicationEventPublisher.publishEvent(new UserOnlineEvent(this,user));
+}
+```
+
+```java
+package com.luoying.luochat.common.user.domain.entity;
+
+import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
+import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableName;
+import com.baomidou.mybatisplus.extension.handlers.JacksonTypeHandler;
+import lombok.*;
+
+import java.io.Serializable;
+import java.util.Date;
+
+/**
+ * <p>
+ * 用户表
+ * </p>
+ *
+ * @author <a href="https://github.com/1ranxu">luoying</a>
+ * @since 2024-01-02
+ */
+@Data
+@EqualsAndHashCode(callSuper = false)
+@TableName(value = "user", autoResultMap = true)
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class User implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    /**
+     * 用户id
+     */
+    @TableId(value = "id", type = IdType.AUTO)
+    private Long id;
+
+    /**
+     * 用户昵称
+     */
+    @TableField("name")
+    private String name;
+
+    /**
+     * 用户头像
+     */
+    @TableField("avatar")
+    private String avatar;
+
+    /**
+     * 性别 1为男性，2为女性
+     */
+    @TableField("sex")
+    private Integer sex;
+
+    /**
+     * 微信openid用户标识
+     */
+    @TableField("open_id")
+    private String openId;
+
+    /**
+     * 在线状态 1在线 2离线
+     */
+    @TableField("active_status")
+    private Integer activeStatus;
+
+    /**
+     * 最后上下线时间
+     */
+    @TableField("last_opt_time")
+    private Date lastOptTime;
+
+    /**
+     * ip信息
+     */
+    @TableField(value = "ip_info", typeHandler = JacksonTypeHandler.class)
+    private IpInfo ipInfo;
+
+    /**
+     * 佩戴的徽章id
+     */
+    @TableField("item_id")
+    private Long itemId;
+
+    /**
+     * 使用状态 0.正常 1拉黑
+     */
+    @TableField("status")
+    private Integer status;
+
+    /**
+     * 创建时间
+     */
+    @TableField("create_time")
+    private Date createTime;
+
+    /**
+     * 修改时间
+     */
+    @TableField("update_time")
+    private Date updateTime;
+
+
+    public void refreshIp(String ip) {
+        if (ipInfo == null) { // 为null，说明是第一次注册，createIp和updateIp都要更新；不为null，只需要更新updateIp
+            ipInfo = new IpInfo();
+        }
+        ipInfo.refreshIp(ip);
+    }
+}
+```
+
+```java
+package com.luoying.luochat.common.user.domain.entity;
+
+import cn.hutool.core.util.StrUtil;
+import lombok.Data;
+import org.apache.commons.lang3.StringUtils;
+
+import java.io.Serializable;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * 用户ip信息
+ *
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 9:43
+ */
+@Data
+public class IpInfo implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+    //注册时的ip
+    private String createIp;
+    //注册时的ip详情
+    private IpDetail createIpDetail;
+    //最新登录的ip
+    private String updateIp;
+    //最新登录的ip详情
+    private IpDetail updateIpDetail;
+
+    public void refreshIp(String ip) {
+        // 如果传进来的ip是空的就不更新了
+        if (StringUtils.isEmpty(ip)) {
+            return;
+        }
+        // 用户第一次注册，createIp没有才更新
+        if (StrUtil.isBlank(createIp)) {
+            createIp = ip;
+        }
+        // updateIp是无论如何都要更新的
+        updateIp = ip;
+    }
+}
+```
+
+
+
+### ip的保存
+
+```java
+package com.luoying.luochat.common.user.domain.enums;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/7 12:10
+ */
+@AllArgsConstructor
+@Getter
+public enum UserActiveStatusEnum {
+
+    ONLINE(1,"在线"),
+    OFFLINE(2,"离线");
+
+
+    private final Integer status;
+
+    private final String desc;
+}
+```
+
+```java
+package com.luoying.luochat.common.common.event.listener;
+
+import com.luoying.luochat.common.common.event.UserOnlineEvent;
+import com.luoying.luochat.common.common.event.UserRegisterEvent;
+import com.luoying.luochat.common.user.dao.UserDao;
+import com.luoying.luochat.common.user.domain.entity.User;
+import com.luoying.luochat.common.user.domain.enums.UserActiveStatusEnum;
+import com.luoying.luochat.common.user.service.IpService;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+import javax.annotation.Resource;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 10:09
+ */
+@Component
+public class UserOnlineListener {
+    @Resource
+    private IpService ipService;
+    @Resource
+    private UserDao userDao;
+
+    @Async
+    @TransactionalEventListener(classes = UserOnlineEvent.class, phase = TransactionPhase.AFTER_COMMIT,fallbackExecution = true)
+    public void updateDB(UserOnlineEvent event) {
+        User user = event.getUser();
+        User update = new User();
+        update.setId(user.getId());
+        // 更新用户上线时间
+        update.setLastOptTime(user.getLastOptTime());
+        // 更新用户的ip信息
+        update.setIpInfo(user.getIpInfo());
+        // 更新用户的活跃状态
+        update.setActiveStatus(UserActiveStatusEnum.ONLINE.getStatus());
+        userDao.updateById(update);
+        // 我们只设置了ip，ip的详情还未设置，接下来设置用户ip详情
+        ipService.refreshIpDetailAsync(user.getId());
+    }
+}
+```
+
+```java
+package com.luoying.luochat.common.user.service.impl;
+
+import cn.hutool.core.thread.NamedThreadFactory;
+import cn.hutool.core.util.StrUtil;
+import cn.hutool.http.HttpUtil;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.luoying.luochat.common.common.domain.vo.resp.ApiResult;
+import com.luoying.luochat.common.common.utils.JsonUtils;
+import com.luoying.luochat.common.user.dao.UserDao;
+import com.luoying.luochat.common.user.domain.entity.IpDetail;
+import com.luoying.luochat.common.user.domain.entity.IpInfo;
+import com.luoying.luochat.common.user.domain.entity.User;
+import com.luoying.luochat.common.user.service.IpService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.Resource;
+import java.util.Date;
+import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 10:25
+ */
+@Service
+@Slf4j
+public class IpServiceImpl implements IpService, DisposableBean {
+    private static ExecutorService executor = new ThreadPoolExecutor(1, 1,
+            0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<Runnable>(500), new NamedThreadFactory("refresh-ipDetail", false));
+
+    @Resource
+    private UserDao userDao;
+
+    @Override
+    public void refreshIpDetailAsync(Long uid) {
+        // 异步解析ip详情
+        executor.execute(() -> {
+            // 查询用户
+            User user = userDao.getById(uid);
+            // 获取ipInfo
+            IpInfo ipInfo = user.getIpInfo();
+            if (Objects.isNull(ipInfo)) {// 如果ipInfo为null，直接返回，不需要更新
+                return;
+            }
+            // 判断updateIp是否需要刷新，需要则ip不为空
+            String ip = ipInfo.needRefreshUpdateIp();
+            // ip为空，说明不需要更新
+            if (StrUtil.isBlank(ip)) {
+                return;
+            }
+            // 根据ip获取ipDetail，如果失败，休眠2秒，再尝试，加起来总共三次
+            IpDetail ipDetail = tryGetIpDetailOrNullThreeTimes(ip);
+            if (Objects.nonNull(ipDetail)) {
+                // 更新ipInfo中的ipDetail
+                ipInfo.refreshIpDetail(ipDetail);
+                // 更新数据库
+                User update = new User();
+                update.setId(uid);
+                update.setIpInfo(ipInfo);
+                userDao.updateById(update);
+            }
+        });
+    }
+
+    private static IpDetail tryGetIpDetailOrNullThreeTimes(String ip) {
+        for (int i = 0; i < 3; i++) {
+            // 根据ip获取ipDetail
+            IpDetail ipDetail = getIPDetailOrNull(ip);
+            // 获取到了就返回
+            if (Objects.nonNull(ipDetail)) {
+                return ipDetail;
+            } else { // 失败就休眠2秒，再尝试
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    log.error("tryGetIpDetailOrNullThreeTimes InterruptedException", e);
+                }
+            }
+        }
+        return null;
+    }
+
+    private static IpDetail getIPDetailOrNull(String ip) {
+        try {
+            // 请求淘宝IP解析接口，获取数据
+            String url = String.format("https://ip.taobao.com/outGetIpInfo?ip=%s&accessKey=alibaba-inc", ip);
+            String data = HttpUtil.get(url);
+            // 使用JsonUtils把数据转换成ApiResult类型，因为两者都有一个data字段
+            ApiResult<IpDetail> apiResult = JsonUtils.toObj(data, new TypeReference<ApiResult<IpDetail>>() {
+            });
+            // 返回ipDetail
+            return apiResult.getData();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public static void main(String[] args) {
+        // 测试
+        AtomicReference<Date> begin = new AtomicReference<>(new Date());
+        for (int i = 0; i < 100; i++) {
+            int finalI = i;
+            executor.execute(() -> {
+                IpDetail ipDetail = tryGetIpDetailOrNullThreeTimes("125.80.190.40");
+                if (Objects.nonNull(ipDetail)) {
+                    Date date = new Date();
+                    System.out.println(String.format("第%d次成功，耗时:%dms", finalI, (date.getTime() - begin.get().getTime())));
+                    begin.set(date);
+                }
+            });
+        }
+    }
+
+    @Override
+    public void destroy() throws Exception {
+        // 关闭线程池，接下来线程池不会接收新任务，会继续处理未完成的任务
+        executor.shutdown();
+        if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {//最多处理30秒，处理不完强制关闭
+            if (log.isErrorEnabled()) {
+                log.error("Timed out while waiting for executor [{}] to terminate", executor);
+            }
+        }
+    }
+}
+
+```
+
+```java
+package com.luoying.luochat.common.user.domain.entity;
+
+import cn.hutool.core.util.StrUtil;
+import lombok.Data;
+import org.apache.commons.lang3.StringUtils;
+
+import java.io.Serializable;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * 用户ip信息
+ *
+ * @Author 落樱的悔恨
+ * @Date 2024/1/8 9:43
+ */
+@Data
+public class IpInfo implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+    //注册时的ip
+    private String createIp;
+    //注册时的ip详情
+    private IpDetail createIpDetail;
+    //最新登录的ip
+    private String updateIp;
+    //最新登录的ip详情
+    private IpDetail updateIpDetail;
+
+    public void refreshIp(String ip) {
+        // 如果传进来的ip是空的就不更新了
+        if (StringUtils.isEmpty(ip)) {
+            return;
+        }
+        // 用户第一次注册，createIp没有才更新
+        if (StrUtil.isBlank(createIp)) {
+            createIp = ip;
+        }
+        // updateIp是无论如何都要更新的
+        updateIp = ip;
+    }
+
+    /**
+     * 判断updateIp是否需要刷新就行，
+     * 1.如果是用户第一次注册时，createIp和updateIp是相同的，但updateIpDetail为null，updateIp与updateIpDetail中的ip不相等，
+     * notNeedRefresh为false，返回updateIp，根据updateIp查出ipDetail，调用refreshIpDetail方法
+     * 然后更新createIpDetail和updateIpDetail
+     * 2.如果是登录，updateIpDetail不为null，updateIp与updateIpDetail中的ip不相等，notNeedRefresh为false，
+     * 返回updateIp，根据updateIp查出ipDetail，调用refreshIpDetail方法，更新updateIpDetail，但不更新createIpDetail
+     * 3.如果是登录，updateIpDetail不为null，updateIp与updateIpDetail中的ip相等，notNeedRefresh为true
+     * 返回null，就什么也不更新。同时实现了createIpDetail只会在注册时更新
+     *
+     * @return
+     */
+    public String needRefreshUpdateIp() {
+        boolean notNeedRefresh = Optional.ofNullable(updateIpDetail)
+                .map(IpDetail::getIp)
+                .filter(ip -> Objects.equals(ip, updateIp))
+                .isPresent();
+        return notNeedRefresh ? null : updateIp;
+    }
+
+    public void refreshIpDetail(IpDetail ipDetail) {
+        if (Objects.equals(createIp, ipDetail.getIp())) {
+            createIpDetail = ipDetail;
+        }
+        if (Objects.equals(updateIp, ipDetail.getIp())) {
+            updateIpDetail = ipDetail;
+        }
+    }
+}
+```
+
+`NettyWebSocketServerHandler`实现exceptionCaught
+
+```java
+@Override
+public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+    log.error("exceptionCaught:{}",cause);
+}
+```
+
+
+
+### 基于mq实现ip解析框架
+
+我们的ip解析框架基于线程池，任务存放于内存中，如果突然中断，会导致任务丢失。
+
+我们可以使用mq实现，设置多个消费者，每个消费者可以在不同服务器，提高用户ip解析的速度和吞吐，解决淘宝IP解析API的频控问题，因为它是根据服务器ip来频控的。同时，如果失败了，mq可以进行消息重发，直到消息确认。
+
+但需要对mq的并发进行一定的控制，不然会造成大量的竞争和失败。所要限制mq的消费并发度，可以consumeThreadNumber设置为1。
