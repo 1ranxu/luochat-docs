@@ -9716,6 +9716,105 @@ IM的消息发送一般分为两个场景。
 
 上面的设计完全是本项目的设计。通过抽象一层房间表，来屏蔽单聊群聊的差异，让消息表和会话表的存储变得更加简单。
 
+```sql
+DROP TABLE IF EXISTS `room`;
+CREATE TABLE `room` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `type` int(11) NOT NULL COMMENT '房间类型 1群聊 2单聊',
+  `hot_flag` int(11) DEFAULT '0' COMMENT '是否全员展示 0否 1是',
+  `active_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '群最后消息的更新时间（热点群不需要写扩散，只更新这里）',
+  `last_msg_id` bigint(20) DEFAULT NULL COMMENT '会话中的最后一条消息id',
+  `ext_json` json DEFAULT NULL COMMENT '额外信息（根据不同类型房间有不同存储的东西）',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='房间表';
+DROP TABLE IF EXISTS `room_friend`;
+CREATE TABLE `room_friend` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `room_id` bigint(20) NOT NULL COMMENT '房间id',
+  `uid1` bigint(20) NOT NULL COMMENT 'uid1（更小的uid）',
+  `uid2` bigint(20) NOT NULL COMMENT 'uid2（更大的uid）',
+  `room_key` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '房间key由两个uid拼接，先做排序uid1_uid2',
+  `status` int(11) NOT NULL COMMENT '房间状态 0正常 1禁用(删好友了禁用)',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE KEY `room_key` (`room_key`) USING BTREE,
+  KEY `idx_room_id` (`room_id`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='单聊房间表';
+DROP TABLE IF EXISTS `room_group`;
+CREATE TABLE `room_group` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `room_id` bigint(20) NOT NULL COMMENT '房间id',
+  `name` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '群名称',
+  `avatar` varchar(256) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '群头像',
+  `ext_json` json DEFAULT NULL COMMENT '额外信息（根据不同类型房间有不同存储的东西）',
+  `delete_status` int(1) NOT NULL DEFAULT '0' COMMENT '逻辑删除(0-正常,1-删除)',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_room_id` (`room_id`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='群聊房间表';
+DROP TABLE IF EXISTS `group_member`;
+CREATE TABLE `group_member` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `group_id` bigint(20) NOT NULL COMMENT '群主id',
+  `uid` bigint(20) NOT NULL COMMENT '成员uid',
+  `role` int(11) NOT NULL COMMENT '成员角色 1群主 2管理员 3普通成员',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_group_id_role` (`group_id`,`role`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='群成员表';
+DROP TABLE IF EXISTS `contact`;
+CREATE TABLE `contact` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `uid` bigint(20) NOT NULL COMMENT 'uid',
+  `room_id` bigint(20) NOT NULL COMMENT '房间id',
+  `read_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '阅读到的时间',
+  `active_time` datetime(3) DEFAULT NULL COMMENT '会话内消息最后更新的时间(只有普通会话需要维护，全员会话不需要维护)',
+  `last_msg_id` bigint(20) DEFAULT NULL COMMENT '会话最新消息id',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE KEY `uniq_uid_room_id` (`uid`,`room_id`) USING BTREE,
+  KEY `idx_room_id_read_time` (`room_id`,`read_time`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会话列表';
+DROP TABLE IF EXISTS `message`;
+CREATE TABLE `message`  (
+  `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `room_id` bigint(20) NOT NULL COMMENT '会话表id',
+  `from_uid` bigint(20) NOT NULL COMMENT '消息发送者uid',
+  `content` varchar(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '消息内容',
+  `reply_msg_id` bigint(20) NULL DEFAULT NULL COMMENT '回复的消息内容',
+  `status` int(11) NOT NULL COMMENT '消息状态 0正常 1删除',
+  `gap_count` int(11) NULL DEFAULT NULL COMMENT '与回复的消息间隔多少条',
+  `type` int(11) NULL DEFAULT 1 COMMENT '消息类型 1正常文本 2.撤回消息',
+  `extra` json DEFAULT NULL COMMENT '扩展信息',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_room_id`(`room_id`) USING BTREE,
+  INDEX `idx_from_uid`(`from_uid`) USING BTREE,
+  INDEX `idx_create_time`(`create_time`) USING BTREE,
+  INDEX `idx_update_time`(`update_time`) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '消息表' ROW_FORMAT = Dynamic;
+INSERT INTO `user` (`id`, `name`, `avatar`, `sex`, `open_id`, `last_opt_time`, `ip_info`, `item_id`, `status`, `create_time`, `update_time`) VALUES (1, '系统消息', 'http://mms1.baidu.com/it/u=1979830414,2984779047&fm=253&app=138&f=JPEG&fmt=auto&q=75?w=500&h=500', NULL, '0', '2023-07-01 11:58:24.605', NULL, NULL, 0, '2023-07-01 11:58:24.605', '2023-07-01 12:02:56.900');
+insert INTO `room`(`id`,`type`,`hot_flag`) values (1,1,1);
+insert INTO `room_group`(`id`,`room_id`,`name`,`avatar`) values (1,1,'luochat全员群','');
+```
+
 
 
 ## 消息已读未读
@@ -9948,3 +10047,186 @@ select count(0) from
 这里的`content`、`reply_msg_id`、`gap_count`其实都是文本类型的消息才有的字段，也可以扔extra里面去。设计出来是因为一开始只考虑到了文本消息，后续可以移除这些字段，让消息表更简洁。
 
 消息表最重要的就是**谁**，在哪个**房间**，发送了什么**类型**的消息，**详情**都可以在**extra**里面。
+
+
+
+
+
+
+
+# 联系人模块
+
+## 表设计
+
+![image-20240111125727178](assets/image-20240111125727178.png)
+
+
+
+```sql
+CREATE TABLE `user_apply` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `uid` bigint(20) NOT NULL COMMENT '申请人uid',
+  `type` int(11) NOT NULL COMMENT '申请类型 1加好友',
+  `target_id` bigint(20) NOT NULL COMMENT '接收人uid',
+  `msg` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '申请信息',
+  `status` int(11) NOT NULL COMMENT '申请状态 1待审批 2同意',
+  `read_status` int(11) NOT NULL COMMENT '阅读状态 1未读 2已读',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_uid_target_id` (`uid`,`target_id`) USING BTREE,
+  KEY `idx_target_id_read_status` (`target_id`,`read_status`) USING BTREE,
+  KEY `idx_target_id` (`target_id`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户申请表';
+DROP TABLE IF EXISTS `user_friend`;
+CREATE TABLE `user_friend` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `uid` bigint(20) NOT NULL COMMENT 'uid',
+  `friend_uid` bigint(20) NOT NULL COMMENT '好友uid',
+  `delete_status` int(1) NOT NULL DEFAULT '0' COMMENT '逻辑删除(0-正常,1-删除)',
+  `create_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  KEY `idx_uid_friend_uid` (`uid`,`friend_uid`) USING BTREE,
+  KEY `idx_create_time` (`create_time`) USING BTREE,
+  KEY `idx_update_time` (`update_time`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户联系人表';
+```
+
+
+
+## 功能预览
+
+### 好友申请列表
+
+![image-20240111114039982](assets/image-20240111114039982.png)
+
+`申请列表`：这个申请列表的每一个申请就对应申请表的每一行记录，关键字段：申请人`uid`，目标用户`target_id`，申请消息`msg`。
+
+`接受请求`：每条申请记录展示`接受`或者`已添加`，取决于申请记录里的一个状态字段`status`是否同意。
+
+`好友申请未读数`：`read_status`字段代表该申请记录是否被目标用户读取，通过这个字段来计算有多少未读的好友申请，然后展示在联系人图标的位置
+
+![image-20240111113721084](assets/image-20240111113721084.png)
+
+### 联系人列表
+
+![image-20240111122310636](assets/image-20240111122310636.png)
+
+参考微信的设计，联系人列表这边做的比较简单，只需要知道自己好友有哪些，并且为了支持删除好友，加个`delete_status`逻辑删除字段。
+
+`发送消息`：需要根据`我的uid`，`好友friend_uid`，组合成`uid1_uid2`，就可以找到我们的聊天会话，然后对里面发送消息。
+
+
+
+### 判断是否是自己好友
+
+主要用于点击其他用户头像时的交互展示，能够提供判断，如果是自己好友，就没有添加好友的选项。
+
+![image-20240111131547471](assets/image-20240111131547471.png)![image-20240111131555539](assets/image-20240111131555539.png)
+
+
+
+## 游标翻页
+
+深翻页的场景，解决方案基本都是【游标翻页】。为什么？这就需要谈谈普通翻页和游标翻页的区别，它们之间的优缺点。
+
+### 深翻页问题
+
+普通分页通常会出现在后端的管理系统，前端会展示一个分页条，可以指定一页的条数、选择查看第几页。
+
+普通分页可以查出满足条件的记录总数，用总数除以每页的条数就能计算出页数
+
+![image-20240111202148706](assets/image-20240111202148706.png)
+
+前端请求时需要携带`pageNo`和`pageSize`
+
+![image-20240111202730745](assets/image-20240111202730745.png)
+
+假设前端想要查看第11页的内容，传的值`pageNo`=11，`pageSize`=10，对应数据库的查询语句就是
+
+```sql
+# 100代表需要跳过的条数，10代表跳过指定条数后，往后需要再取的条数。
+# (pageNo - 1) * pageSize,pageSize
+select * from table limit 100,10
+```
+
+![image-20240111204843521](assets/image-20240111204843521.png)
+
+需要在数据库的位置先读出100条，然后丢弃，丢弃完100条后，再继续取10条。如果我们翻页到了很深的地方，比如读到了第1000页，需要先查询10000条进行丢弃，再取选那么个10条选用，这个效率太低了。
+
+> 我们经常需要定时任务全量去跑一张表的数据，普通翻页去跑的话，到后面数据量大的时候，就会越跑越慢，这就是深翻页带来的问题。
+
+
+
+**解决方案：**
+
+不论第几页，我们都不需要跳过一些值，直接取`limit 0,10`，sql语句变成了
+
+```sql
+select * from table limit 0,10
+```
+
+但取到的是1-10这些记录，取不到我们想要的101-110，可以再加一个条件
+
+```sql
+select * from table where id>100 order by id limit 0,10
+```
+
+![image-20240111204758056](assets/image-20240111204758056.png)
+
+只要id这个字段有参照索引，就能直接定位到101这个位置，然后依次去取10条记录，以后无论翻页到多大，通过索引直接定位到读取的位置，查询下一页时需要提供上一页最后一条数据的位置作为索引，也就是`110`。这个`110`就是我们的游标，这种分页也就叫**游标翻页。**
+
+
+
+### 游标翻页介绍
+
+游标翻页可以完美解决深翻页问题，依赖的就是我们的游标`cursor`。针对mysql的游标翻页，我们需要通过`cursor`快速定位到指定记录，意味着游标`cursor`必须添加索引，且唯一和递增。
+
+![image-20240111205339070](assets/image-20240111205339070.png)
+
+前端之前传的`pageNo`字段改为`cursor`字段，`cursor`是上一次查询结果的最后一条数据的位置，由后端返回，作为下一次查询的游标
+
+![image-20240111205851718](assets/image-20240111205851718.png)
+
+
+
+### 查看历史消息
+
+用户一进入页面，首先会拉取一页最新的消息，如果用户的鼠标滚轮的往上滑，需要加载历史消息。
+
+#### 普通分页
+
+1.首先倒序读取消息表最新的一页三条数据
+
+![image-20240111211757684](assets/image-20240111211757684.png)
+
+2.这时候有了一条新消息，消息列表出现消息7
+
+![image-20240111212026971](assets/image-20240111212026971.png)
+
+3.滚轮继续向上滑动，查询历史消息的第二页。因为新消息的影响，导致我们的第二页重复拉取了消息4，特别在新消息变动很频繁的情况下，整合列表会出现大量重复和无效翻页。
+
+![image-20240111212103187](assets/image-20240111212103187.png)
+
+#### 游标翻页
+
+1.第一页查询条件其实一模一样，因为第一页游标还是初始值0
+
+![image-20240111212244397](assets/image-20240111212244397.png)
+
+2.这时候有了一条新消息，消息列表出现消息7
+
+![image-20240111212333380](assets/image-20240111212333380.png)
+
+3.滚轮继续向上滑动，根据游标位置往上再查一页（也就是三条）
+
+![image-20240111212421767](assets/image-20240111212421767.png)
+
+![image-20240111212458452](assets/image-20240111212458452.png)
+
+
+
+### 游标翻页工具类实现
